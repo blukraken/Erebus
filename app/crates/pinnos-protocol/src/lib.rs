@@ -10,7 +10,7 @@ use std::io::{self, Read, Write};
 pub const PIPE_NAME: &str = r"\\.\pipe\pinnos-core";
 
 /// Bumped on any breaking change. Peers with different versions refuse each other.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Most changed files listed in [`GitState::files`]; the rest only count toward `changed`.
 pub const MAX_CHANGED_FILES: usize = 64;
@@ -21,6 +21,9 @@ pub const MAX_FRAME: u32 = 4 * 1024 * 1024;
 /// How often the core sends [`CoreMsg::Heartbeat`]. The face treats the link as lost after
 /// three missed beats.
 pub const HEARTBEAT_MS: u64 = 1000;
+
+/// Vitals samples the core keeps and replays to a face on connect. One sample per second.
+pub const VITALS_HISTORY: usize = 90;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
@@ -34,6 +37,52 @@ pub enum CoreMsg {
     Exit,
     /// The current context. Sent after `Hello` and again whenever any field changes.
     Context(Context),
+    /// System vitals. Sent after `Hello` with up to [`VITALS_HISTORY`] samples, then once a
+    /// second with the newest sample only.
+    Vitals(Vitals),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Vitals {
+    pub hw: Hardware,
+    /// Oldest first.
+    pub samples: Vec<Sample>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Hardware {
+    pub ram_total_mb: u32,
+    /// Logical cores; the length of every [`Sample::cores`].
+    pub cores: u16,
+    /// `None` when NVML is unavailable.
+    pub gpu: Option<GpuInfo>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GpuInfo {
+    pub name: String,
+    pub vram_total_mb: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Sample {
+    pub unix_ms: u64,
+    pub ram_used_mb: u32,
+    /// All cores, 0..=100.
+    pub cpu: f32,
+    /// Per logical core, 0..=100.
+    pub cores: Vec<u8>,
+    /// `None` when NVML is unavailable or the read failed.
+    pub gpu: Option<GpuSample>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuSample {
+    /// 0..=100.
+    pub util: u8,
+    pub vram_used_mb: u32,
+    pub temp_c: u8,
+    pub power_w: u16,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -154,6 +203,31 @@ mod tests {
                     behind: None,
                 }),
             }),
+        });
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &msg).unwrap();
+        let back: CoreMsg = read_frame(&mut buf.as_slice()).unwrap();
+        assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn vitals_round_trip() {
+        let msg = CoreMsg::Vitals(Vitals {
+            hw: Hardware {
+                ram_total_mb: 31_640,
+                cores: 4,
+                gpu: Some(GpuInfo { name: "NVIDIA GeForce RTX 5080".into(), vram_total_mb: 16_303 }),
+            },
+            samples: vec![
+                Sample { unix_ms: 1_000, ram_used_mb: 14_200, cpu: 12.5, cores: vec![10, 20, 5, 15], gpu: None },
+                Sample {
+                    unix_ms: 2_000,
+                    ram_used_mb: 14_250,
+                    cpu: 22.0,
+                    cores: vec![30, 20, 18, 20],
+                    gpu: Some(GpuSample { util: 63, vram_used_mb: 9_100, temp_c: 71, power_w: 288 }),
+                },
+            ],
         });
         let mut buf = Vec::new();
         write_frame(&mut buf, &msg).unwrap();

@@ -43,8 +43,15 @@ impl Gpu {
                 }
             };
 
+            // Offscreen runs time their passes when the adapter allows it.
+            let timestamps = if window.is_none() {
+                adapter.features() & wgpu::Features::TIMESTAMP_QUERY
+            } else {
+                wgpu::Features::empty()
+            };
             let desc = wgpu::DeviceDescriptor {
                 label: Some("pinnos-face"),
+                required_features: timestamps,
                 memory_hints: wgpu::MemoryHints::MemoryUsage,
                 ..Default::default()
             };

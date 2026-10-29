@@ -9,8 +9,8 @@
 //! travel in opposite directions, each a jittering cluster of dots. Every trail dot lights
 //! by how far it lies behind each head, so each head drags a trail one loop long that stays
 //! bright for a quarter loop, then fades slowly to a faint floor. The whole knot is always
-//! traced, and a short dark gap runs in front of each head. Where the heads pass, the strand
-//! flashes. Depth only dims and shrinks the far side a little, continuously, so nothing
+//! traced, and a short dark gap runs in front of each head. The heads pass each other without
+//! a flash. Depth only dims and shrinks the far side a little, continuously, so nothing
 //! flares as it turns toward the viewer.
 //!
 //! The knot is pearl, so the Claude entity's ember stays distinct; only the centre is hot.
@@ -36,8 +36,8 @@ const LOD_SECS: f32 = 0.5;
 const HOVER_SECS: f32 = 0.18;
 /// Shell turn per ambient millisecond.
 const TURN: f64 = 0.00016;
-/// Head travel per ambient millisecond: one loop in 5.5 s while live, 0.35x that dormant.
-const HEAD: f64 = TAU / 5500.0;
+/// Head travel per ambient millisecond: one loop in 11 s while live, 0.35x that dormant.
+const HEAD: f64 = TAU / 11000.0;
 /// Dots in each head cluster; the rest of the trefoil is trail.
 const HEAD_N: usize = 70;
 /// Haze dots drawn at full detail; Glance fades out every other one.
