@@ -32,8 +32,8 @@ const TAU = 6.2831853;
 // File timings, seconds; they match `files.rs`.
 const GROW = 0.5;
 const FADE = 0.6;
-const DASH = 0.5;
-const TRAIL = 1.2;
+const DASH = 0.9;
+const TRAIL = 1.6;
 const FLASH = 0.5;
 // A dash covers distance as progress to this power: it accelerates.
 const DASH_EASE = 2.2;

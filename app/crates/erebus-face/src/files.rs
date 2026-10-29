@@ -18,12 +18,12 @@ use std::f64::consts::TAU;
 pub const CAP: usize = 2 * erebus_protocol::MAX_CHANGED_FILES;
 pub const GROW_SECS: f64 = 0.5;
 pub const FADE_SECS: f64 = 0.6;
-pub const DASH_SECS: f64 = 0.5;
-pub const TRAIL_SECS: f64 = 1.2;
+pub const DASH_SECS: f64 = 0.9;
+pub const TRAIL_SECS: f64 = 1.6;
 /// The merge flash at the core outlives each arrival by this much.
 pub const FLASH_SECS: f64 = 0.5;
 /// The last dash starts within this long of the commit.
-const SPREAD_SECS: f64 = 1.2 - DASH_SECS;
+const SPREAD_SECS: f64 = 2.0;
 /// Closest two glyph centres may sit, in knot radii.
 const MIN_GAP: f64 = 0.34;
 
@@ -174,10 +174,10 @@ fn dash_offsets(keys: &[u64]) -> Vec<f64> {
             v * 0.004
         } else if u < 0.7 {
             cluster = 1;
-            0.008 + v * 0.05
+            0.03 + v * 0.12
         } else {
             cluster = 1;
-            0.25 + v * 0.15
+            0.45 + v * 0.3
         };
         gaps.push(g);
     }
