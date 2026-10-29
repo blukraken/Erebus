@@ -31,6 +31,10 @@
 //! Fullscreen presents unchanged frames while the cursor moves; see [`MOTION_FRAMES`].
 //! `--no-motion-frames` turns that off.
 //!
+//! Vitals samples arrive once a second and draw in the frames above; they never wake the
+//! window on their own, except to redraw a visible window that is not animating. Samples
+//! that arrive while Suspended are kept for the next frame.
+//!
 //! Every redraw request carries a reason. The first seconds after start or an F11 toggle
 //! log each request and frame; `--trace` logs them all, plus per-second input counts.
 
@@ -38,6 +42,7 @@ use crate::gpu::Gpu;
 use crate::knot;
 use crate::link::{self, Link, LinkEvent};
 use crate::render::{self, Close, Renderer, Scene, View};
+use crate::vitals::{self, Vitals};
 use pinnos_protocol::{Context, FaceMsg, GitState};
 use pinnos_theme as theme;
 use std::sync::Arc;
@@ -115,6 +120,8 @@ enum Hit {
     /// The top rail: moves the window in windowed mode; a double-click toggles fullscreen.
     Rail,
     Edge(ResizeDirection),
+    /// A vitals row: shows its tooltip.
+    Vital(vitals::Row),
 }
 
 struct Live {
@@ -199,6 +206,7 @@ struct App {
     /// When the animation clock last advanced.
     last_sim: Instant,
     state: StateLog,
+    vitals: Vitals,
 }
 
 pub fn run(opts: Options) -> Result<(), String> {
@@ -256,6 +264,7 @@ pub fn run(opts: Options) -> Result<(), String> {
         last_frame: now,
         last_sim: now,
         state: StateLog { state: RenderState::Calm, since: now, frames: 0 },
+        vitals: Vitals::default(),
     };
     app.reduced = app.opts.reduced_motion || animations_off();
     log::info!("reduced motion {}", if app.reduced { "on" } else { "off" });
@@ -342,6 +351,10 @@ fn thread_cpu_us() -> u64 {
     unsafe { GetThreadTimes(GetCurrentThread(), &mut c, &mut e, &mut k, &mut u) };
     let t = |f: FILETIME| ((f.dwHighDateTime as u64) << 32 | f.dwLowDateTime as u64) / 10;
     t(k) + t(u)
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
 /// Windows "Animation effects" is off.
@@ -547,6 +560,7 @@ impl App {
         if prev == RenderState::Suspended {
             // Missed events do not replay: the knot resumes at the current state.
             self.sim.snap();
+            self.vitals.snap();
             self.last_sim = now;
             self.redraw("resumed");
         }
@@ -717,11 +731,23 @@ impl App {
         let c = render::chrome(cw, ch, scale);
         let [x0, y0, x1, y1] = c.close_hit;
         if x >= x0 && x < x1 && y >= y0 && y < y1 {
-            Hit::Close
+            return Hit::Close;
         } else if y < c.rail {
-            Hit::Rail
-        } else {
-            Hit::None
+            return Hit::Rail;
+        }
+        let vital = self.vitals.has_data().then(|| vitals::column(cw, ch, scale)?.hit(x, y)).flatten();
+        vital.map_or(Hit::None, Hit::Vital)
+    }
+
+    /// Shows the hovered row's tooltip. A window that is not animating draws it at once.
+    fn set_vital_hover(&mut self, row: Option<vitals::Row>) {
+        if row == self.vitals.hover {
+            return;
+        }
+        self.vitals.hover = row;
+        log::info!("vitals hover {row:?}");
+        if !self.animating() {
+            self.redraw("vitals hover");
         }
     }
 
@@ -771,6 +797,7 @@ impl App {
         }
         self.cursor = Some(p);
         let hit = self.hit(p);
+        self.set_vital_hover(if let Hit::Vital(r) = hit { Some(r) } else { None });
         let over = hit == Hit::Close;
         self.set_close(match (self.close_armed, over) {
             (true, true) => Close::Press,
@@ -837,7 +864,7 @@ impl App {
                     }
                 }
             }
-            Hit::None => {}
+            Hit::Vital(_) | Hit::None => {}
         }
     }
 
@@ -850,6 +877,7 @@ impl App {
         let dt = now.duration_since(self.last_sim).as_secs_f32();
         self.last_sim = now;
         self.sim.step(dt, self.reduced);
+        self.vitals.step(dt, self.reduced);
         let view = View { palette: self.palette, link: smoothstep(self.link_t), close: self.close };
         let more = if self.knot_live() { self.sim.files.more() } else { None };
         let Some(live) = &mut self.live else { return };
@@ -892,6 +920,8 @@ impl App {
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
         let (w, h, scale) = (config.width, config.height, window.scale_factor());
         let crumbs: Vec<&str> = self.crumbs.iter().map(String::as_str).collect();
+        let column = vitals::column(w, h, scale);
+        let vitals = self.vitals.frame(column.as_ref(), unix_ms(), (w, h), self.reduced);
         let scene = Scene {
             view,
             knot: self.sim.uniform(w, h, scale, self.reduced),
@@ -903,6 +933,7 @@ impl App {
             file_label: self.file_label.as_ref().map(|(p, at)| (p.as_str(), *at)),
             file_label_alpha: self.sim.file_hover(),
             more: more.as_deref(),
+            vitals: vitals.as_ref(),
         };
         renderer.draw(gpu, &mut encoder, &target, (w, h), scale, &scene);
         gpu.queue.submit([encoder.finish()]);
@@ -1061,6 +1092,9 @@ impl ApplicationHandler<UiEvent> for App {
                     event_loop.exit();
                     return;
                 }
+                if !up {
+                    self.vitals.clear();
+                }
                 if up != self.link_up {
                     self.link_up = up;
                     self.last_tick = Instant::now();
@@ -1074,6 +1108,18 @@ impl ApplicationHandler<UiEvent> for App {
                 }
             }
             LinkEvent::Context(ctx) => self.set_context(*ctx),
+            LinkEvent::Vitals(v) => {
+                let first = !self.vitals.has_data();
+                let (hw, n) = (v.hw.clone(), v.samples.len());
+                let added = self.vitals.ingest(*v);
+                if first {
+                    log::info!("vitals: {added} of {n} samples, {hw:?}");
+                }
+                // Animating frames pick the sample up; Suspended keeps it for later.
+                if self.state.state != RenderState::Suspended && !self.animating() {
+                    self.redraw("vitals");
+                }
+            }
             LinkEvent::Show => self.show(),
             LinkEvent::Exit => {
                 log::info!("exit requested by core");
@@ -1108,6 +1154,7 @@ impl ApplicationHandler<UiEvent> for App {
             WindowEvent::CursorMoved { position, .. } => self.cursor_moved(position),
             WindowEvent::CursorLeft { .. } => {
                 self.last_move = None;
+                self.set_vital_hover(None);
                 if !self.close_armed {
                     self.set_close(Close::Rest);
                 }
