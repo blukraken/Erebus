@@ -1,12 +1,13 @@
 //! Owns the list of connected faces and acts on tray actions. Everything reaches it as an
 //! [`Event`] on one channel, so no state is shared across tasks or threads.
 
+use std::collections::VecDeque;
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use pinnos_protocol::{Context, CoreMsg};
+use pinnos_protocol::{Context, CoreMsg, Hardware, Sample, Vitals, VITALS_HISTORY};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 use tokio::time::{timeout_at, Instant};
@@ -36,6 +37,10 @@ pub enum Event {
     Tray(TrayAction),
     /// The context service's latest reading. Faces hear about it only when it differs.
     Context(Context),
+    /// The machine's fixed facts, sent once by the sampler before its first sample.
+    Hardware(Hardware),
+    /// One second of vitals.
+    Vitals(Sample),
 }
 
 pub fn channel() -> (UnboundedSender<Event>, UnboundedReceiver<Event>) {
@@ -55,6 +60,8 @@ async fn run(
 ) {
     let mut faces: Vec<(u64, u32, UnboundedSender<Out>)> = Vec::new();
     let mut current: Option<Context> = None;
+    let mut hw: Option<Hardware> = None;
+    let mut ring: VecDeque<Sample> = VecDeque::with_capacity(VITALS_HISTORY);
     let publish = |n: usize| {
         if let Some(hwnd) = tray {
             tray::faces_changed(hwnd, n);
@@ -65,6 +72,10 @@ async fn run(
             Event::Up(id, pid, tx) => {
                 if let Some(c) = &current {
                     let _ = tx.send(Out { msg: CoreMsg::Context(c.clone()), done: None });
+                }
+                if let Some(hw) = &hw {
+                    let samples = ring.iter().cloned().collect();
+                    let _ = tx.send(Out { msg: CoreMsg::Vitals(Vitals { hw: hw.clone(), samples }), done: None });
                 }
                 faces.push((id, pid, tx));
                 log_info!("face {id} registered; {} connected", faces.len());
@@ -87,6 +98,23 @@ async fn run(
                     let _ = tx.send(Out { msg: CoreMsg::Context(next.clone()), done: None });
                 }
                 current = Some(next);
+            }
+            Event::Hardware(next) => {
+                let gpu = next.gpu.as_ref().map_or("none".to_owned(), |g| format!("{} ({} MB)", g.name, g.vram_total_mb));
+                log_info!("hardware: {} MB RAM, {} cores, gpu {gpu}", next.ram_total_mb, next.cores);
+                hw = Some(next);
+            }
+            Event::Vitals(sample) => {
+                if ring.len() == VITALS_HISTORY {
+                    ring.pop_front();
+                }
+                ring.push_back(sample.clone());
+                if let Some(hw) = &hw {
+                    for (_, _, tx) in &faces {
+                        let msg = CoreMsg::Vitals(Vitals { hw: hw.clone(), samples: vec![sample.clone()] });
+                        let _ = tx.send(Out { msg, done: None });
+                    }
+                }
             }
             Event::Tray(action) => {
                 log_info!("tray action {action:?} with {} face(s)", faces.len());
