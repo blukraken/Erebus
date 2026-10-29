@@ -967,8 +967,9 @@ impl App {
             }
             Hit::Feed(feed::Spot::Row(id)) => {
                 if let Some(s) = self.feed.session_of(id).map(str::to_string) {
-                    log::info!("feed: ping {s}");
-                    self.net.ping(&s);
+                    let w = self.feed.worker_of(id).map(str::to_string);
+                    log::info!("feed: ping {s} {}", w.as_deref().unwrap_or(""));
+                    self.net.ping(&s, w.as_deref());
                     self.redraw("ping");
                 }
             }
@@ -1261,6 +1262,7 @@ impl ApplicationHandler<UiEvent> for App {
             }
             LinkEvent::Feed(events) => {
                 self.net.note_activity(&events);
+                self.net.pulse(&events);
                 self.feed.ingest(events);
                 if self.state.state != RenderState::Suspended && !self.animating() {
                     self.redraw("feed");

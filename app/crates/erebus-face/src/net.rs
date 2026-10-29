@@ -14,10 +14,13 @@
 //!
 //! Positions are in knot radii from the knot's centre, so the layout follows any window size.
 
+use crate::codex;
+use crate::reach;
 use crate::globes::GlobeInst;
 use crate::vitals::{self, Seg};
-use erebus_protocol::{FeedEvent, SessionInfo, SessionStatus};
+use erebus_protocol::{FeedEvent, SessionInfo, SessionStatus, TaskKind};
 use erebus_theme::{self as theme, Rgb};
+use std::collections::VecDeque;
 use std::f32::consts::{PI, TAU};
 
 /// Idle this long, a busy-placed session is let go, milliseconds.
@@ -27,9 +30,35 @@ pub const RELEASE_AFTER: u64 = 5 * 60 * 1000;
 const GROW: f32 = 2.6;
 const FLICKER: f32 = 0.3;
 const UNRAVEL: f32 = 0.8;
-const CONDENSE: f32 = 0.7;
-const WORKER_CONDENSE: f32 = 0.5;
-const DISSOLVE: f32 = 1.0;
+const CONDENSE: f32 = 1.5;
+/// On the first snapshot, each globe starts condensing this long after the one before.
+const STAGGER: f32 = 0.35;
+/// A worker glides out of its parent's nucleus to its slot over this long, growing and
+/// condensing as it goes; done, it turns to dust where it stands over `WORKER_DISSOLVE`.
+const WORKER_EMERGE: f32 = 4.0;
+const WORKER_DISSOLVE: f32 = 3.0;
+/// A pulse runs a session braid, globe to core, in this long, and a worker braid, worker to
+/// parent, in this long, seconds.
+const PULSE_SECS: f32 = 2.2;
+const WORKER_PULSE_SECS: f32 = 1.4;
+/// Pulses on one braid launch at least this far apart, seconds, so events from one instant
+/// run one behind another in feed order.
+const PULSE_GAP: f32 = 0.35;
+/// Pulses travelling on one braid at once, and waiting behind them.
+const PULSE_LIVE: usize = 6;
+const PULSE_QUEUE: usize = 24;
+/// A pulse's lit tail along the fibres, prototype pixels.
+const PULSE_TAIL: f32 = 110.0;
+
+/// A task's reach feels out from the globe's rim over this long and unravels back over
+/// this long, seconds; it runs this many globe radii out.
+const REACH_GROW: f32 = 1.2;
+const REACH_UNRAVEL: f32 = 1.5;
+const REACH_LEN: f32 = 1.4;
+
+/// Workers glide to new places in the fan with this time constant, seconds.
+const FAN_TAU: f32 = 0.7;
+const DISSOLVE: f32 = 1.5;
 const REDUCED: f32 = 0.15;
 /// Idle globes: opacity and size.
 const REST_DIM: f32 = 0.4;
@@ -80,7 +109,18 @@ const BREATH_DIM: f32 = 0.45;
 const WAIT_GREY: f32 = 0.5;
 /// Time constant of the ease into and out of waiting, seconds.
 const WAIT_TAU: f32 = 0.8;
+/// A headless Codex run's globe, as a share of a session's.
+const HEADLESS_SIZE: f32 = 0.75;
 const PUSH: f32 = 40.0;
+/// Bodies nudge each other at this share of `PUSH`, so a newcomer eases its neighbours aside.
+const NUDGE: f32 = 0.5;
+/// Braids push more gently and only once touched: a thin half width and a soft give. Reach
+/// threads push harder than braids, softer than bodies. In knot radii.
+const BRAID_HALF: f32 = 0.05;
+const BRAID_GIVE: f32 = 0.25;
+const REACH_HALF: f32 = 0.03;
+const REACH_GIVE: f32 = 0.4;
+const REACH_END_R: f32 = 0.09;
 /// Arrived: this close to the anchor, in knot radii.
 const ARRIVED: f32 = 0.2;
 
@@ -95,10 +135,107 @@ enum Phase {
     Dissolving,
 }
 
+/// Pulses on one braid: those travelling, and those queued behind them in feed order.
+#[derive(Clone, Debug)]
+struct Pulses {
+    /// Seconds each has run, and its colour.
+    live: Vec<(f32, Rgb)>,
+    queue: VecDeque<Rgb>,
+    /// Seconds since the last launch.
+    since: f32,
+}
+
+impl Default for Pulses {
+    fn default() -> Self {
+        Pulses { live: Vec::new(), queue: VecDeque::new(), since: PULSE_GAP }
+    }
+}
+
+impl Pulses {
+    /// Queues one; false when the queue is full and it was dropped.
+    fn push(&mut self, col: Rgb) -> bool {
+        if self.queue.len() >= PULSE_QUEUE {
+            return false;
+        }
+        self.queue.push_back(col);
+        true
+    }
+
+    fn step(&mut self, dt: f32, secs: f32) {
+        self.since += dt;
+        for p in &mut self.live {
+            p.0 += dt;
+        }
+        self.live.retain(|p| p.0 < secs);
+        if self.since >= PULSE_GAP && self.live.len() < PULSE_LIVE {
+            if let Some(col) = self.queue.pop_front() {
+                self.live.push((0.0, col));
+                self.since = 0.0;
+            }
+        }
+    }
+
+    fn busy(&self) -> bool {
+        !self.live.is_empty() || !self.queue.is_empty()
+    }
+
+    /// Where each travelling pulse is lit, for `braid`.
+    fn lit(&self, secs: f32, reduced: bool) -> Vec<Lit> {
+        self.live
+            .iter()
+            .map(|&(t, col)| {
+                let k = (t / secs).clamp(0.0, 1.0);
+                let rise = (t / 0.3).clamp(0.0, 1.0);
+                let fall = ((secs - t) / 0.25).clamp(0.0, 1.0);
+                let light = rise * rise * (3.0 - 2.0 * rise) * fall * fall * (3.0 - 2.0 * fall);
+                Lit { head: 1.0 - e_in_out(k), light, col, whole: reduced }
+            })
+            .collect()
+    }
+}
+
+/// A pulse as `braid` draws it: its head, 1 at the far end down to 0 at the near end, how
+/// lit it is, and its colour. A `whole` pulse lights every fibre at once, for reduced motion.
+#[derive(Clone, Copy, Debug)]
+struct Lit {
+    head: f32,
+    light: f32,
+    col: Rgb,
+    whole: bool,
+}
+
+/// A background shell or monitor, reaching out from its session's globe.
+#[derive(Clone, Debug)]
+struct Reach {
+    id: String,
+    kind: TaskKind,
+    label: String,
+    /// 0..1: grown out, or what is left as it unravels.
+    form: f32,
+    /// Its angle round the globe, easing toward its slot.
+    ang: f32,
+    /// -1 above the globe, 1 below; kept for life, so a reach never swings across.
+    side: f32,
+    hover: f32,
+    leaving: bool,
+    /// Seconds since it appeared, for its creep or ripples.
+    age: f32,
+}
+
 #[derive(Clone, Debug)]
 struct Worker {
     id: String,
+    /// "w1", and the agent type, for its name chip.
+    label: String,
     kind: String,
+    hover: f32,
+    /// Its angle in the fan, radians, easing toward its slot as workers come and go.
+    ang: f32,
+    /// Seconds since a feed click pinged it, while the ping lasts.
+    ping: Option<f32>,
+    pulses: Pulses,
+    /// 0..1 along the glide out of the parent's nucleus, linear in time.
+    emerge: f32,
     form: f32,
     leaving: bool,
 }
@@ -132,6 +269,15 @@ struct Globe {
     ping: Option<f32>,
     /// Seconds of braid twist, advanced at one steady rate so the twist never jumps.
     twist: f32,
+    /// A Codex session, drawn as a frost wireframe; a headless one is its hollow shell.
+    codex: bool,
+    headless: bool,
+    /// Seconds since it appeared, for the Codex globe's stepped turn.
+    age: f32,
+    /// Ended while held near: it dissolves where it is, its braid unravelling with it.
+    ended_near: bool,
+    pulses: Pulses,
+    tasks: Vec<Reach>,
 }
 
 /// The network area in physical pixels.
@@ -202,19 +348,26 @@ fn len(v: [f32; 2]) -> f32 {
 }
 
 impl Globe {
+    /// Work under way: a turn, a live worker, or a background task, even one silently
+    /// waiting on a long job.
+    fn working(&self) -> bool {
+        self.busy || self.workers.iter().any(|w| !w.leaving) || self.tasks.iter().any(|r| !r.leaving)
+    }
+
     /// Held near the knot: hauled in, arrived, or about to be let go.
     fn near(&self) -> bool {
         match self.phase {
             Phase::Pulling => self.t >= GROW,
             Phase::Docked => true,
             Phase::Releasing => self.t < FLICKER,
-            Phase::Resting | Phase::Dissolving => false,
+            Phase::Dissolving => self.ended_near,
+            Phase::Resting => false,
         }
     }
 
     /// Where its spring pulls, swaying slowly on two unrelated periods.
     fn anchor(&self, clock: f32, reduced: bool) -> [f32; 2] {
-        self.anchor_at(self.near() || (self.phase == Phase::Dissolving && self.dim > 0.7), clock, reduced)
+        self.anchor_at(self.near(), clock, reduced)
     }
 
     fn anchor_at(&self, near: bool, clock: f32, reduced: bool) -> [f32; 2] {
@@ -233,8 +386,40 @@ impl Globe {
 
     /// Radius in knot radii, without hover; docked sessions with workers also hold their fan.
     fn body(&self) -> f32 {
-        let r = SESSION_R * self.scale;
-        if self.phase == Phase::Docked && !self.workers.is_empty() { (WORKER_D + WORKER_R) * self.scale } else { r }
+        SESSION_R * self.scale * if self.headless { HEADLESS_SIZE } else { 1.0 }
+    }
+
+    /// What this globe carries, in knot radii: its own circle, its workers and reach ends,
+    /// and the braids and reach threads that join them.
+    fn shapes(&self) -> Body {
+        let mut b = Body::default();
+        if self.form <= 0.0 {
+            return b;
+        }
+        let r = self.body();
+        b.circles.push((self.p, r));
+        // Its braid, from the knot's centre, while drawn.
+        if matches!(self.phase, Phase::Pulling | Phase::Docked | Phase::Releasing) {
+            b.segments.push(([0.0, 0.0], self.p, BRAID_HALF, BRAID_GIVE));
+        }
+        for w in self.workers.iter().filter(|w| w.form > 0.0) {
+            let e = e_in_out(w.emerge);
+            let ang = if w.ang.is_nan() { 0.0 } else { w.ang };
+            let d = WORKER_D * self.scale * e;
+            let c = [self.p[0] + d * ang.cos(), self.p[1] + d * ang.sin()];
+            b.circles.push((c, WORKER_R * self.scale * (0.12 + 0.88 * e)));
+            b.segments.push((self.p, c, BRAID_HALF * 0.7 * self.scale, BRAID_GIVE));
+        }
+        for t in self.tasks.iter().filter(|t| t.form > 0.0) {
+            let ang = if t.ang.is_nan() { reach_slot(t.side, 0) } else { t.ang };
+            let (s, c) = ang.sin_cos();
+            let out = r + REACH_LEN * r.max(SESSION_R * 0.5) * t.form;
+            let rim = [self.p[0] + c * r, self.p[1] + s * r];
+            let end = [self.p[0] + c * out, self.p[1] + s * out];
+            b.segments.push((rim, end, REACH_HALF, REACH_GIVE));
+            b.circles.push((end, REACH_END_R));
+        }
+        b
     }
 }
 
@@ -272,12 +457,19 @@ impl Net {
                         v: [0.0; 2],
                         dim: REST_DIM,
                         scale: REST_SCALE,
-                        form: if instant { 1.0 } else { 0.0 },
+                        // Below zero waits its turn to condense.
+                        form: if instant { -STAGGER / CONDENSE * self.globes.len() as f32 } else { 0.0 },
                         active_ms: s.started_unix_ms,
                         workers: Vec::new(),
                         hover: 0.0,
                         ping: None,
                         twist: 0.0,
+                        codex: s.harness == "codex",
+                        headless: s.headless,
+                        age: 0.0,
+                        ended_near: false,
+                        pulses: Pulses::default(),
+                        tasks: Vec::new(),
                     };
                     g.p = g.anchor(self.clock, true);
                     self.globes.push(g);
@@ -293,20 +485,37 @@ impl Net {
             }
             for w in &s.workers {
                 if !g.workers.iter().any(|x| x.id == w.id && !x.leaving) {
-                    g.workers.push(Worker { id: w.id.clone(), kind: w.kind.clone(), form: if instant { 1.0 } else { 0.0 }, leaving: false });
+                    g.workers.push(Worker { id: w.id.clone(), label: w.label.clone(), kind: w.kind.clone(), hover: 0.0, ang: f32::NAN, ping: None, pulses: Pulses::default(), emerge: 0.0, form: 0.0, leaving: false });
                 }
             }
             for x in &mut g.workers {
-                if !s.workers.iter().any(|w| w.id == x.id) {
+                if !x.leaving && !s.workers.iter().any(|w| w.id == x.id) {
+                    // A worker finishing is work too: the release clock starts over.
                     x.leaving = true;
+                    g.active_ms = g.active_ms.max(now_ms);
                 }
             }
             if !s.workers.is_empty() {
                 g.active_ms = g.active_ms.max(now_ms);
             }
+            for t in &s.tasks {
+                if !g.tasks.iter().any(|x| x.id == t.id && !x.leaving) {
+                    // The side with fewer reaches, above first.
+                    let count = |side: f32| g.tasks.iter().filter(|x| !x.leaving && x.side == side).count();
+                    let side = if count(-1.0) <= count(1.0) { -1.0 } else { 1.0 };
+                    g.tasks.push(Reach { id: t.id.clone(), kind: t.kind, label: t.label.clone(), form: 0.0, ang: f32::NAN, side, hover: 0.0, leaving: false, age: 0.0 });
+                }
+            }
+            for x in &mut g.tasks {
+                if !x.leaving && !s.tasks.iter().any(|t| t.id == x.id) {
+                    x.leaving = true;
+                    g.active_ms = g.active_ms.max(now_ms);
+                }
+            }
         }
         for g in &mut self.globes {
             if g.phase != Phase::Dissolving && !sessions.iter().any(|s| s.id == g.id) {
+                g.ended_near = g.near();
                 g.phase = Phase::Dissolving;
                 g.t = 0.0;
             }
@@ -314,6 +523,27 @@ impl Net {
         self.settle(now_ms);
         if instant {
             self.snap();
+        }
+    }
+
+    /// Live feed events pulse the braids in feed order: a worker's event runs its braid into
+    /// its parent, a session's runs its braid into the core. History and braids not drawn
+    /// get nothing.
+    pub fn pulse(&mut self, events: &[FeedEvent]) {
+        for e in events.iter().filter(|e| !e.backlog) {
+            let Some(g) = self.globes.iter_mut().find(|g| g.id == e.session && g.phase != Phase::Dissolving) else { continue };
+            let col = crate::feed::pulse_color(e);
+            let queued = match e.worker.as_deref() {
+                Some(id) => match g.workers.iter_mut().find(|w| w.id == id && !w.leaving && w.emerge > 0.5) {
+                    Some(w) => w.pulses.push(col),
+                    None => continue,
+                },
+                None if g.form > 0.5 && matches!(g.phase, Phase::Pulling | Phase::Docked | Phase::Releasing) => g.pulses.push(col),
+                None => continue,
+            };
+            if !queued {
+                log::info!("pulse queue full on {}; dropped {:?}", g.label, e.kind);
+            }
         }
     }
 
@@ -329,9 +559,10 @@ impl Net {
     /// Pulls busy sessions in and lets long-idle ones go.
     fn settle(&mut self, now_ms: u64) {
         for g in &mut self.globes {
-            let idle_long = !g.busy && now_ms.saturating_sub(g.active_ms) >= RELEASE_AFTER;
+            let working = g.working();
+            let idle_long = !working && now_ms.saturating_sub(g.active_ms) >= RELEASE_AFTER;
             let next = match g.phase {
-                Phase::Resting | Phase::Releasing if g.busy => Some(Phase::Pulling),
+                Phase::Resting | Phase::Releasing if g.working() => Some(Phase::Pulling),
                 Phase::Docked if idle_long => Some(Phase::Releasing),
                 _ => None,
             };
@@ -351,7 +582,11 @@ impl Net {
                 || len(g.v) > 0.01
                 || g.workers.iter().any(|w| w.leaving || w.form < 1.0)
                 || g.ping.is_some()
+                || g.workers.iter().any(|w| w.ping.is_some() || w.pulses.busy())
+                || g.pulses.busy()
+                || g.tasks.iter().any(|r| r.leaving || r.form < 1.0)
                 || (g.hover - if self.hover.as_deref() == Some(&g.id) { 1.0 } else { 0.0 }).abs() > 0.001
+                || g.workers.iter().any(|w| (w.hover - if self.hover.as_deref() == Some(&w.id) { 1.0 } else { 0.0 }).abs() > 0.001)
         })
     }
 
@@ -377,6 +612,7 @@ impl Net {
             g.t += dt;
             if !reduced {
                 g.twist += dt * TWIST_PACE * (1.0 - (1.0 - WAIT_TWIST) * g.wait);
+                g.age += dt;
             }
             let w = if g.waiting { 1.0 } else { 0.0 };
             g.wait += (w - g.wait) * ease(WAIT_TAU);
@@ -390,7 +626,7 @@ impl Net {
                 *a += dt;
             }
             let (target_form, span) = if g.phase == Phase::Dissolving { (0.0, DISSOLVE) } else { (1.0, CONDENSE) };
-            g.form = if target_form > g.form { (g.form + dt / quick(span)).min(1.0) } else { (g.form - dt / quick(span)).max(0.0) };
+            g.form = if target_form > g.form { (g.form + dt / quick(span)).min(target_form) } else { (g.form - dt / quick(span)).max(target_form) };
             let near = g.near();
             let (dim, scale) = if near { (1.0, near_scale) } else { (REST_DIM, far_scale) };
             g.dim += (dim - g.dim) * ease(0.6);
@@ -400,19 +636,69 @@ impl Net {
             if (h - g.hover).abs() < 0.001 {
                 g.hover = h;
             }
+            g.pulses.step(dt, PULSE_SECS);
+            for w in &mut g.workers {
+                w.pulses.step(dt, WORKER_PULSE_SECS);
+                if let Some(p) = &mut w.ping {
+                    *p += dt;
+                    if *p >= PING_SECS {
+                        w.ping = None;
+                    }
+                }
+            }
             if let Some(p) = &mut g.ping {
                 *p += dt;
                 if *p >= PING_SECS {
                     g.ping = None;
                 }
             }
-            let shown = g.phase == Phase::Docked;
+            // Workers wait for their parent to finish condensing.
+            let shown = g.phase == Phase::Docked && g.form >= 1.0;
+            let staying = g.workers.iter().filter(|w| !w.leaving).count();
+            let mut k = 0;
             for w in &mut g.workers {
-                let target = if shown && !w.leaving { 1.0 } else { 0.0 };
-                let span = quick(if target > 0.0 { WORKER_CONDENSE } else { DISSOLVE * 0.6 });
-                w.form = if target > w.form { (w.form + dt / span).min(1.0) } else { (w.form - dt / span).max(0.0) };
+                if !w.leaving {
+                    let target = fan(k, staying);
+                    k += 1;
+                    w.ang = if w.ang.is_nan() { target } else { w.ang + (target - w.ang) * ease(FAN_TAU) };
+                }
+                let h = if hover.as_deref() == Some(&w.id) { 1.0 } else { 0.0 };
+                w.hover += (h - w.hover) * ease(HOVER_TAU);
+                if (h - w.hover).abs() < 0.001 {
+                    w.hover = h;
+                }
+                if w.leaving {
+                    // Done: dust where it stands.
+                    w.form = (w.form - dt / quick(WORKER_DISSOLVE)).max(0.0);
+                } else {
+                    // Out of the nucleus while the parent is docked, back into it otherwise.
+                    let step = dt / quick(WORKER_EMERGE);
+                    w.emerge = if shown { (w.emerge + step).min(1.0) } else { (w.emerge - 2.0 * step).max(0.0) };
+                    w.form = w.emerge;
+                }
             }
             g.workers.retain(|w| !(w.leaving && w.form <= 0.0));
+
+            // Reaches feel out while the globe is held near and formed, and draw back in
+            // when it is let go or the task ends.
+            let held = g.form >= 1.0 && matches!(g.phase, Phase::Pulling | Phase::Docked);
+            let mut ranks = [0usize; 2];
+            for r in &mut g.tasks {
+                r.age += dt;
+                if !r.leaving {
+                    let rank = &mut ranks[usize::from(r.side > 0.0)];
+                    let target = reach_slot(r.side, *rank);
+                    *rank += 1;
+                    r.ang = if r.ang.is_nan() { target } else { r.ang + (target - r.ang) * ease(FAN_TAU) };
+                }
+                let h = if hover.as_deref() == Some(&r.id) { 1.0 } else { 0.0 };
+                r.hover += (h - r.hover) * ease(HOVER_TAU);
+                if (h - r.hover).abs() < 0.001 {
+                    r.hover = h;
+                }
+                r.form = if held && !r.leaving { (r.form + dt / quick(REACH_GROW)).min(1.0) } else { (r.form - dt / quick(REACH_UNRAVEL)).max(0.0) };
+            }
+            g.tasks.retain(|r| !(r.leaving && r.form <= 0.0));
         }
         self.globes.retain(|g| !(g.phase == Phase::Dissolving && g.form <= 0.0));
         if let Some(area) = self.area {
@@ -443,6 +729,7 @@ impl Net {
         let [x0, x1, y0, y1] = area.bounds();
         let n = self.globes.len();
         let mut force = vec![[0.0f32; 2]; n];
+        let bodies: Vec<Body> = self.globes.iter().map(Globe::shapes).collect();
         for (i, g) in self.globes.iter().enumerate() {
             // Springs hand over by cross-fading, so the pull never snaps: rest to haul as
             // the braid latches, haul to hold as it docks, hold to rest as it lets go.
@@ -474,16 +761,14 @@ impl Net {
                 force[i][1] += w * (k * (a[1] - g.p[1]) - 2.0 * k.sqrt() * g.v[1]);
             }
             let r = g.body();
-            for (j, o) in self.globes.iter().enumerate().skip(i + 1) {
-                let d = [g.p[0] - o.p[0], g.p[1] - o.p[1]];
-                let dl = len(d).max(1e-4);
-                let over = r + o.body() + GAP - dl;
-                if over > 0.0 {
-                    let push = [d[0] / dl * over * PUSH, d[1] / dl * over * PUSH];
-                    force[i][0] += push[0];
-                    force[i][1] += push[1];
-                    force[j][0] -= push[0];
-                    force[j][1] -= push[1];
+            // Everything a globe carries pushes on everything another globe carries: globes,
+            // workers and reach ends as circles, braids and reach threads as segments.
+            for j in i + 1..n {
+                for (push, on_i, on_j) in contacts(&bodies[i], &bodies[j]) {
+                    force[i][0] += push[0] * on_i;
+                    force[i][1] += push[1] * on_i;
+                    force[j][0] -= push[0] * on_j;
+                    force[j][1] -= push[1] * on_j;
                 }
             }
             let dk = len(g.p).max(1e-4);
@@ -508,7 +793,22 @@ impl Net {
         }
     }
 
-    /// Finishes every move at once and settles the bodies apart.
+    /// Every globe and worker fully formed at once. Only for stills, which have no time to
+    /// condense in.
+    pub fn finish(&mut self) {
+        for g in &mut self.globes {
+            g.form = 1.0;
+            let docked = g.phase == Phase::Docked;
+            let n = g.workers.len();
+            for (k, w) in g.workers.iter_mut().enumerate() {
+                (w.form, w.emerge) = if docked { (1.0, 1.0) } else { (0.0, 0.0) };
+                w.ang = fan(k, n);
+            }
+        }
+    }
+
+    /// Finishes every move at once and settles the bodies apart. Forms are left alone: a globe
+    /// still condensing goes on condensing.
     pub fn snap(&mut self) {
         let (near_scale, far_scale) = self.scales();
         for g in &mut self.globes {
@@ -523,11 +823,7 @@ impl Net {
             let near = g.near();
             g.dim = if near { 1.0 } else { REST_DIM };
             g.scale = if near { near_scale } else { far_scale };
-            g.form = if g.phase == Phase::Dissolving { 0.0 } else { 1.0 };
             g.p = g.anchor(self.clock, true);
-            for w in &mut g.workers {
-                w.form = if near && !w.leaving { 1.0 } else { 0.0 };
-            }
             g.workers.retain(|w| !w.leaving);
         }
         self.globes.retain(|g| g.phase != Phase::Dissolving);
@@ -542,9 +838,12 @@ impl Net {
     }
 
     /// Rings a globe for a moment, for a feed row the person clicked.
-    pub fn ping(&mut self, session: &str) {
-        if let Some(g) = self.globes.iter_mut().find(|g| g.id == session) {
-            g.ping = Some(0.0);
+    /// Rings the worker a feed row came from, or its session when the session said it.
+    pub fn ping(&mut self, session: &str, worker: Option<&str>) {
+        let Some(g) = self.globes.iter_mut().find(|g| g.id == session) else { return };
+        match worker.and_then(|id| g.workers.iter_mut().find(|w| w.id == id && !w.leaving)) {
+            Some(w) => w.ping = Some(0.0),
+            None => g.ping = Some(0.0),
         }
     }
 
@@ -582,22 +881,42 @@ struct Placed {
 
 impl Net {
     fn place(&self, g: &Globe, area: &Area) -> Placed {
-        let r = SESSION_R * area.knot_r * g.scale * (1.0 + (HOVER_GROW - 1.0) * g.hover);
+        let size = if g.headless { HEADLESS_SIZE } else { 1.0 };
+        let r = SESSION_R * area.knot_r * g.scale * size * (1.0 + (HOVER_GROW - 1.0) * g.hover);
         Placed { c: area.px(g.p), r, a: g.dim }
     }
 
-    fn worker_place(parent: &Placed, scale: f32, i: usize, n: usize, area: &Area) -> Placed {
-        let ang = if n <= 1 { 0.0 } else { (-40.0 + 80.0 * i as f32 / (n - 1) as f32).to_radians() };
-        let d = WORKER_D * area.knot_r * scale;
-        Placed { c: [parent.c[0] + d * ang.cos(), parent.c[1] + d * ang.sin()], r: WORKER_R * area.knot_r * scale, a: parent.a }
+    /// A worker at angle `ang`, `e` of the way along its eased glide from the parent's centre
+    /// to its slot, growing from a speck as it goes.
+    fn worker_place(parent: &Placed, scale: f32, ang: f32, e: f32, area: &Area) -> Placed {
+        let ang = if ang.is_nan() { 0.0 } else { ang };
+        let d = WORKER_D * area.knot_r * scale * e;
+        let grow = 0.12 + 0.88 * e;
+        Placed { c: [parent.c[0] + d * ang.cos(), parent.c[1] + d * ang.sin()], r: WORKER_R * area.knot_r * scale * grow, a: parent.a }
     }
 
-    /// The globe under `(x, y)`.
+    /// Where a task's reach leaves its globe's rim and where it ends.
+    fn reach_ends(p: &Placed, r: &Reach, area: &Area) -> ([f32; 2], [f32; 2]) {
+        let ang = if r.ang.is_nan() { reach_slot(r.side, 0) } else { r.ang };
+        let (s, c) = ang.sin_cos();
+        let len = REACH_LEN * p.r.max(SESSION_R * area.knot_r * 0.5);
+        ([p.c[0] + c * p.r, p.c[1] + s * p.r], [p.c[0] + c * (p.r + len), p.c[1] + s * (p.r + len)])
+    }
+
+    /// The globe or worker under `(x, y)`, by id. Workers sit on top of their parents.
     pub fn hit(&self, area: &Area, x: f32, y: f32) -> Option<String> {
+        let inside = |c: [f32; 2], r: f32| (x - c[0]).powi(2) + (y - c[1]).powi(2) < r * r;
         self.globes.iter().rev().find_map(|g| {
             let p = self.place(g, area);
-            let (dx, dy) = (x - p.c[0], y - p.c[1]);
-            (g.form > 0.5 && dx * dx + dy * dy < p.r * p.r).then(|| g.id.clone())
+            let worker = g.workers.iter().find_map(|w| {
+                let wp = Self::worker_place(&p, g.scale, w.ang, e_in_out(w.emerge), area);
+                (w.form > 0.5 && !w.leaving && inside(wp.c, wp.r * HOVER_GROW)).then(|| w.id.clone())
+            });
+            let task = g.tasks.iter().find_map(|r| {
+                let (_, end) = Self::reach_ends(&p, r, area);
+                (r.form > 0.8 && !r.leaving && inside(end, 10.0 * area.u * 2.0)).then(|| r.id.clone())
+            });
+            worker.or(task).or_else(|| (g.form > 0.5 && inside(p.c, p.r)).then(|| g.id.clone()))
         })
     }
 
@@ -611,30 +930,71 @@ impl Net {
         let mut globes = Vec::with_capacity(16);
         let mut segs = Vec::with_capacity(512);
         let mut label = None;
+        let mut worker_label: Option<Label> = None;
         for g in &self.globes {
             let p = self.place(g, area);
             let a = p.a * g.form.clamp(0.0, 1.0).sqrt();
-            let [er, eg, eb] = theme::EMBER.srgb_f32();
-            globes.push(GlobeInst {
-                pos: [p.c[0], p.c[1], p.r, self.rot + phase(g.seed) * 0.37],
-                color: [er, eg, eb, p.a],
-                form: [0.0, g.form, if g.busy { 0.16 } else { 0.06 }, (g.seed % 997) as f32],
-            });
-            if a > 0.01 {
+            if g.codex {
+                let leaving = g.phase == Phase::Dissolving;
+                let ball = codex::Ball { c: p.c, r: p.r, alpha: p.a, secs: g.age, phase: phase(g.seed), headless: g.headless, form: g.form, leaving, u, reduced };
+                codex::ball(&mut segs, &ball);
+            } else {
+                let [er, eg, eb] = theme::EMBER.srgb_f32();
+                globes.push(GlobeInst {
+                    pos: [p.c[0], p.c[1], p.r, self.rot + phase(g.seed) * 0.37],
+                    color: [er, eg, eb, p.a],
+                    form: [0.0, g.form.clamp(0.0, 1.0), if g.busy { 0.16 } else { 0.06 }, (g.seed % 997) as f32],
+                });
+            }
+            if a > 0.01 && !g.codex {
                 segs.push(vitals::glow(p.c[0], p.c[1], 7.2 * p.r, theme::EMBER, 0.5 * a));
                 segs.push(vitals::glow(p.c[0], p.c[1], 1.2 * p.r, theme::HOT, 0.55 * a));
                 ticks(&mut segs, p.c, p.r + 5.0 * sc * g.scale, 72, 1.8 * sc * g.scale, 6, theme::EMBER, 0.32 * a, lws);
             }
             if let Some(t) = g.ping {
-                let k = 1.0 - t / PING_SECS;
-                let br = if reduced { 1.0 } else { 0.6 + 0.4 * (t * 8.0).sin() };
-                ring(&mut segs, p.c, p.r + 12.0 * sc, theme::BONE, 0.9 * k * br, 1.6 * lws);
+                ring(&mut segs, p.c, p.r + 12.0 * sc, theme::BONE, 0.9 * ping_light(t, reduced), 1.6 * lws);
             }
             session_braid(&mut segs, area, g, &p, reduced, self.clock);
 
-            let n = g.workers.len();
+            for (i, r) in g.tasks.iter().enumerate() {
+                if r.form <= 0.0 {
+                    continue;
+                }
+                let (from, to) = Self::reach_ends(&p, r, area);
+                let growing = !r.leaving && r.form < 1.0;
+                let span = if growing { e_out(r.form) } else { r.form };
+                let spec = Braid {
+                    strands: 2,
+                    fibres: 0,
+                    lam: 46.0,
+                    amp: 2.6,
+                    om: if r.kind == TaskKind::Monitor { 0.7 } else { 1.6 },
+                    width: 0.8,
+                    alpha: if r.kind == TaskKind::Monitor { 0.74 } else { 0.55 },
+                    col: reach::color(r.kind),
+                };
+                braid(&mut segs, from, to, 0.0, span, span < 1.0, p.a, &spec, &[], area.u, r.age, g.seed + 101 * i as u32, reduced);
+                let secs = r.age + phase(g.seed + i as u32);
+                reach::end(&mut segs, &reach::End { kind: r.kind, from, to, form: r.form, secs, hover: r.hover, alpha: p.a, u: area.u, reduced });
+                if r.hover > 0.01 && r.form > 0.8 {
+                    let what = if r.kind == TaskKind::Monitor { "monitor" } else { "shell" };
+                    worker_label = Some(Label { text: format!("{} · {what} {}", g.label, r.label), at: [to[0], to[1] - 14.0 * sc], alpha: r.hover });
+                }
+            }
+
             for (i, w) in g.workers.iter().enumerate() {
-                let wp = Self::worker_place(&p, g.scale, i, n, area);
+                let e = e_in_out(w.emerge);
+                let mut wp = Self::worker_place(&p, g.scale, w.ang, e, area);
+                wp.r *= 1.0 + (HOVER_GROW - 1.0) * w.hover;
+                let grow = 0.12 + 0.88 * e;
+                if let Some(t) = w.ping {
+                    ring(&mut segs, wp.c, wp.r + 6.0 * sc * g.scale, theme::BONE, 0.9 * ping_light(t, reduced), 1.4 * lws);
+                }
+                let show = w.hover.max(w.ping.map_or(0.0, |t| ((1.0 - t / PING_SECS) * 4.0).min(1.0)));
+                if show > 0.01 && w.form > 0.5 {
+                    let text = format!("{}·{} · {}", g.label, w.label, w.kind);
+                    worker_label = Some(Label { text, at: [wp.c[0], wp.c[1] - wp.r], alpha: show });
+                }
                 let wa = wp.a * w.form.sqrt();
                 let [br, bg, bb] = theme::BONE.srgb_f32();
                 globes.push(GlobeInst {
@@ -643,15 +1003,21 @@ impl Net {
                     form: [1.0, w.form, 0.0, ((g.seed + 31 * i as u32) % 997) as f32],
                 });
                 if wa > 0.01 {
-                    // The worker braid grows as the worker condenses and unravels as it goes.
+                    // The worker braid trails out of the parent's nucleus behind the worker and
+                    // fades as it turns to dust.
                     let spec = Braid { strands: 3, fibres: 3, lam: 104.0, amp: 6.0 * g.scale, om: 3.0, width: 1.1, alpha: 0.8, col: theme::BONE };
-                    braid(&mut segs, p.c, wp.c, 0.08, w.form, false, wp.a, &spec, area.u, g.twist, g.seed + i as u32, reduced);
+                    let lit = w.pulses.lit(WORKER_PULSE_SECS, reduced);
+                    braid(&mut segs, p.c, wp.c, 0.08, 1.0, false, wa, &spec, &lit, area.u, g.twist, g.seed + i as u32, reduced);
                     segs.push(vitals::glow(wp.c[0], wp.c[1], 6.0 * wp.r, theme::BONE, 0.28 * wa));
-                    ticks(&mut segs, wp.c, wp.r + 3.0 * sc * g.scale, 24, 1.5 * sc * g.scale, 0, theme::BONE, 0.3 * wa, lws);
+                    ticks(&mut segs, wp.c, wp.r + 3.0 * sc * g.scale * grow, 24, 1.5 * sc * g.scale * grow, 0, theme::BONE, 0.3 * wa, lws);
                 }
             }
 
             let show = g.hover.max(g.ping.map_or(0.0, |t| ((1.0 - t / PING_SECS) * 4.0).min(1.0)));
+            if worker_label.is_some() {
+                label = worker_label.take();
+                continue;
+            }
             if show > 0.01 && g.form > 0.5 {
                 let state = if g.waiting { "waiting" } else if g.busy { "busy" } else { "idle" };
                 let workers = match g.workers.iter().filter(|w| !w.leaving).count() {
@@ -670,6 +1036,73 @@ impl Net {
         }
         Some(Frame { globes, segs, key: std::hash::Hasher::finish(&h), label })
     }
+}
+
+/// A ping ring's light `t` seconds in: it fades in over a quarter second, pulses, and
+/// fades out by `PING_SECS`.
+fn ping_light(t: f32, reduced: bool) -> f32 {
+    let rise = (t / 0.25).clamp(0.0, 1.0);
+    let br = if reduced { 1.0 } else { 0.6 + 0.4 * (t * 8.0).sin() };
+    rise * rise * (3.0 - 2.0 * rise) * (1.0 - t / PING_SECS) * br
+}
+
+/// The angle of the `k`th reach on one side of a globe (-1 above, 1 below), fanning outward
+/// from just past straight up or down, clear of the knot's braid and the workers.
+fn reach_slot(side: f32, k: usize) -> f32 {
+    side * (100.0 + 24.0 * k as f32).to_radians()
+}
+
+/// The angle of slot `k` of `n` in a worker fan, ±40° about the parent's right.
+fn fan(k: usize, n: usize) -> f32 {
+    if n <= 1 { 0.0 } else { (-40.0 + 80.0 * k as f32 / (n - 1) as f32).to_radians() }
+}
+
+/// A globe's collision shapes in knot radii: circles `(centre, radius)`, and segments
+/// `(from, to, half width, give)`. A segment's give is how softly it pushes, 1 for full.
+#[derive(Default)]
+struct Body {
+    circles: Vec<([f32; 2], f32)>,
+    segments: Vec<([f32; 2], [f32; 2], f32, f32)>,
+}
+
+/// The nearest point to `c` on the segment `a`–`b`, and how far along it lies.
+fn nearest(a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> ([f32; 2], f32) {
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let l2 = (dx * dx + dy * dy).max(1e-8);
+    let t = (((c[0] - a[0]) * dx + (c[1] - a[1]) * dy) / l2).clamp(0.0, 1.0);
+    ([a[0] + dx * t, a[1] + dy * t], t)
+}
+
+/// Pushes between two globes' bodies: each is the push on the first, away from the second,
+/// with how much of it the first and the second take. Circles push both equally; a segment
+/// pushes the circle it touches, with the segment's give, and its own globe takes half.
+fn contacts(a: &Body, b: &Body) -> Vec<([f32; 2], f32, f32)> {
+    let mut out = Vec::new();
+    let push = |from: [f32; 2], to: [f32; 2], over: f32, give: f32, on_from: f32, on_to: f32, out: &mut Vec<_>| {
+        if over <= 0.0 {
+            return;
+        }
+        let d = [from[0] - to[0], from[1] - to[1]];
+        let dl = len(d).max(1e-4);
+        out.push(([d[0] / dl * over * PUSH * give, d[1] / dl * over * PUSH * give], on_from, on_to));
+    };
+    for &(ca, ra) in &a.circles {
+        for &(cb, rb) in &b.circles {
+            push(ca, cb, ra + rb + GAP - len([ca[0] - cb[0], ca[1] - cb[1]]), NUDGE, 1.0, 1.0, &mut out);
+        }
+        for &(s0, s1, w, give) in &b.segments {
+            let (q, _) = nearest(s0, s1, ca);
+            push(ca, q, ra + w - len([ca[0] - q[0], ca[1] - q[1]]), give, 1.0, 0.5, &mut out);
+        }
+    }
+    for &(cb, rb) in &b.circles {
+        for &(s0, s1, w, give) in &a.segments {
+            let (q, _) = nearest(s0, s1, cb);
+            // The push is on `a`, away from `b`: here `a`'s segment is pushed from the circle.
+            push(q, cb, rb + w - len([cb[0] - q[0], cb[1] - q[1]]), give, 0.5, 1.0, &mut out);
+        }
+    }
+    out
 }
 
 /// Fine ticks round a globe, every `major`th one 2.2 times longer; the first at the top.
@@ -712,10 +1145,12 @@ fn session_braid(out: &mut Vec<Seg>, area: &Area, g: &Globe, p: &Placed, reduced
     let q = |secs: f32| if reduced { REDUCED } else { secs };
     let (reach, alpha) = match g.phase {
         Phase::Pulling => (e_out(g.t / q(GROW)), 1.0),
-        Phase::Docked => (1.0, 1.0),
+        // Docked as it condenses (a session already working at startup), the braid feels
+        // out of the nucleus while the globe forms.
+        Phase::Docked => (e_out(g.form), 1.0),
         Phase::Releasing if g.t < q(FLICKER) => (1.0, if reduced { 1.0 } else { 0.55 + 0.45 * (g.t * 60.0).sin().abs() }),
         Phase::Releasing => (1.0 - ((g.t - q(FLICKER)) / q(UNRAVEL)).clamp(0.0, 1.0), 1.0),
-        Phase::Dissolving if g.dim > 0.7 => (g.form, 1.0),
+        Phase::Dissolving if g.ended_near => (g.form, 1.0),
         _ => return,
     };
     if reach <= 0.0 {
@@ -725,8 +1160,10 @@ fn session_braid(out: &mut Vec<Seg>, area: &Area, g: &Globe, p: &Placed, reduced
     // Waiting on a program, the braid greys a little and breathes slowly.
     let breath = 0.5 - 0.5 * (TAU * g.breath / BREATH).cos();
     let alpha = alpha * (1.0 - BREATH_DIM * g.wait * breath);
-    let col = grey(theme::EMBER, WAIT_GREY * g.wait);
-    let spec = Braid { strands: 6, fibres: 4, lam: 118.0, amp: 9.0, om: 3.4, width: 1.25, alpha: 0.9, col };
+    let col = grey(if g.codex { theme::FROST } else { theme::EMBER }, WAIT_GREY * g.wait);
+    // A headless run keeps one loose fibre, so its pulses have a thread to ride.
+    let (strands, fibres) = if g.headless { (3, 1) } else { (6, 4) };
+    let spec = Braid { strands, fibres, lam: 118.0, amp: 9.0, om: 3.4, width: 1.25, alpha: 0.9, col };
     let s = phase(g.seed);
     let mut bow = if g.seed & 1 == 0 { 0.1 } else { -0.1 };
     if !reduced {
@@ -736,10 +1173,12 @@ fn session_braid(out: &mut Vec<Seg>, area: &Area, g: &Globe, p: &Placed, reduced
             bow += 0.16 * (1.0 - reach) * (clock * 1.3 + s * 3.0).sin();
         }
     }
-    let feeling = g.phase == Phase::Pulling && reach < 1.0;
-    let tip = braid(out, a0, a1, bow, reach, feeling, alpha, &spec, area.u, g.twist, g.seed, reduced);
-    if feeling {
-        // A hot spark rides the feeler's tip.
+    // Any end on the move, reaching out or unravelling back, closes to a point.
+    let feeling = reach < 1.0;
+    let lit = g.pulses.lit(PULSE_SECS, reduced);
+    let tip = braid(out, a0, a1, bow, reach, feeling, alpha, &spec, &lit, area.u, g.twist, g.seed, reduced);
+    if feeling && matches!(g.phase, Phase::Pulling | Phase::Docked) {
+        // A hot spark rides the feeler's tip as it reaches out.
         out.push(vitals::glow(tip[0], tip[1], 26.0 * area.u, theme::HOT, 0.9));
     }
 }
@@ -749,6 +1188,12 @@ fn grey(c: Rgb, k: f32) -> Rgb {
     let y = 0.299 * f32::from(c.0) + 0.587 * f32::from(c.1) + 0.114 * f32::from(c.2);
     let ch = |x: u8| (f32::from(x) + (y - f32::from(x)) * k.clamp(0.0, 1.0)).round() as u8;
     Rgb(ch(c.0), ch(c.1), ch(c.2))
+}
+
+/// Prototype `eInOut`: a cubic ease in and out over 0..1.
+fn e_in_out(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    if t < 0.5 { 4.0 * t * t * t } else { 1.0 - (-2.0 * t + 2.0).powi(3) / 2.0 }
 }
 
 /// Prototype `eOut`: a cubic ease out over 0..1.
@@ -768,8 +1213,11 @@ fn bez(a0: [f32; 2], a1: [f32; 2], bow: f32, t: f32) -> [f32; 2] {
 /// the path, loose fibres wider and slower, and a faint underglow. The envelope closes at
 /// both ends of the whole path; strands dim on the far side of each twist. Drawn up to
 /// `reach` of its length; a `feeling` braid also closes at its growing tip. Returns the tip.
+///
+/// The loose fibres flow toward `a0`, the core or parent end, and the `lit` pulses ride
+/// them there. The strands and the underglow never carry a pulse.
 #[allow(clippy::too_many_arguments)]
-fn braid(out: &mut Vec<Seg>, a0: [f32; 2], a1: [f32; 2], bow: f32, reach: f32, feeling: bool, alpha: f32, b: &Braid, u: f32, twist: f32, seed: u32, reduced: bool) -> [f32; 2] {
+fn braid(out: &mut Vec<Seg>, a0: [f32; 2], a1: [f32; 2], bow: f32, reach: f32, feeling: bool, alpha: f32, b: &Braid, lit: &[Lit], u: f32, twist: f32, seed: u32, reduced: bool) -> [f32; 2] {
     let sc = 2.0 * u;
     let lws = (1.6 * u).max(1.0);
     // Points along the bow, one every 14 prototype pixels, with arc length and unit normal.
@@ -790,16 +1238,19 @@ fn braid(out: &mut Vec<Seg>, a0: [f32; 2], a1: [f32; 2], bow: f32, reach: f32, f
     let ph = if reduced { phase(seed) * 0.3 } else { twist * b.om };
     let end = reach.clamp(0.0, 1.0) * total;
     let last = gl.iter().position(|&l| l >= end).unwrap_or(n).max(1);
+    // A moving end closes to a point over this length, strands and underglow alike.
     let taper = 40.0 * sc;
-    let strand = |out: &mut Vec<Seg>, amp: f32, lam: f32, off: f32, a: f32, w: f32| {
+    let closing = |l: f32| {
+        let x = if feeling { ((end - l) / taper).clamp(0.0, 1.0) } else { 1.0 };
+        x * x * (3.0 - 2.0 * x)
+    };
+    let tail = PULSE_TAIL * sc;
+    // `flow` is the wave's direction: +1 runs toward `a1`, -1 toward `a0`.
+    let strand = |out: &mut Vec<Seg>, amp: f32, lam: f32, off: f32, a: f32, w: f32, flow: f32, lit: &[Lit]| {
         let at = |i: usize| {
             let s = gl[i] / total;
-            let mut tap = (PI * s).sin().max(0.0).powf(0.7);
-            if feeling {
-                let x = ((end - gl[i]) / taper).clamp(0.0, 1.0);
-                tap *= x * x * (3.0 - 2.0 * x);
-            }
-            let wv = TAU * gl[i] / lam - ph + off + phase(seed);
+            let tap = (PI * s).sin().max(0.0).powf(0.7) * closing(gl[i]);
+            let wv = TAU * gl[i] / lam - flow * ph + off + phase(seed);
             let nn = normal(i);
             ([pts[i][0] + nn[0] * amp * tap * wv.sin(), pts[i][1] + nn[1] * amp * tap * wv.sin()], wv.cos())
         };
@@ -807,20 +1258,42 @@ fn braid(out: &mut Vec<Seg>, a0: [f32; 2], a1: [f32; 2], bow: f32, reach: f32, f
             let ((p0, d0), (p1, d1)) = (at(i), at(i + 1));
             let depth = ((d0 + d1) * 0.25 + 0.5).clamp(0.0, 1.0);
             out.push(vitals::seg(p0, p1, b.col, a * (0.5 + 0.5 * depth), w));
+            for l in lit {
+                // Lit behind the head (toward `a1`, where it came from), brightest at the head.
+                let behind = (gl[i] + gl[i + 1]) * 0.5 - l.head * total;
+                let f = if l.whole {
+                    1.0
+                } else if behind >= 0.0 {
+                    (1.0 - behind / tail).max(0.0).powf(1.5)
+                } else {
+                    (1.0 + behind / (8.0 * sc)).max(0.0)
+                };
+                if f > 0.0 {
+                    // The lit thread, and a soft halo hugging the same fibre.
+                    let a = l.light * f * (0.6 + 0.4 * depth);
+                    out.push(vitals::soft(p0, p1, l.col, 0.45 * a, 7.0 * sc));
+                    out.push(vitals::seg(p0, p1, l.col, a, w * 2.6));
+                }
+                if !l.whole && gl[i] <= l.head * total && l.head * total < gl[i + 1] {
+                    out.push(vitals::glow(p0[0], p0[1], 16.0 * sc, l.col, 0.75 * l.light));
+                    out.push(vitals::bead(p0[0], p0[1], 3.6 * lws, theme::HOT, 0.9 * l.light));
+                }
+            }
         }
     };
     let (amp, lam) = (b.amp * sc, b.lam * sc);
     // Underglow: one wide, faint band along the path. Soft strokes peak at a third of a
     // hard stroke's mean coverage, so the band carries three times the prototype's alpha.
     for i in 0..last {
-        out.push(vitals::soft(pts[i], pts[i + 1], b.col, 0.15 * alpha, 2.0 * amp + 6.0 * sc));
+        let k = closing(gl[i + 1].min(end));
+        out.push(vitals::soft(pts[i], pts[i + 1], b.col, 0.15 * alpha * k, (2.0 * amp + 6.0 * sc) * (0.3 + 0.7 * k)));
     }
     for k in 0..b.strands {
-        strand(out, amp, lam, k as f32 * TAU / b.strands as f32, b.alpha * alpha, b.width * lws);
+        strand(out, amp, lam, k as f32 * TAU / b.strands as f32, b.alpha * alpha, b.width * lws, 1.0, &[]);
     }
     for k in 0..b.fibres {
         let kf = k as f32;
-        strand(out, amp * (1.7 + 0.35 * kf), lam * (1.45 + 0.2 * kf), (kf + 0.5) * TAU / b.fibres as f32, 0.3 * b.alpha * alpha, 0.7 * lws);
+        strand(out, amp * (1.7 + 0.35 * kf), lam * (1.45 + 0.2 * kf), (kf + 0.5) * TAU / b.fibres as f32, 0.3 * b.alpha * alpha, 0.7 * lws, -1.0, lit);
     }
     pts[last]
 }
@@ -832,14 +1305,21 @@ pub fn canned() -> Vec<SessionInfo> {
         label: label.into(),
         cwd: format!("F:/Projects/{label}"),
         harness: "claude".into(),
+        headless: false,
         status: if busy { SessionStatus::Busy } else { SessionStatus::Idle },
         started_unix_ms: vitals::CANNED_T0 - 600_000,
         workers: (0..workers)
             .map(|i| erebus_protocol::WorkerInfo { id: format!("{id}-w{i}"), label: format!("w{}", i + 1), kind: "Explore".into(), started_unix_ms: vitals::CANNED_T0 })
             .collect(),
         pending: None,
+        tasks: Vec::new(),
     };
-    vec![s("aabbb6cd", "erebus", true, 2), s("31616aa1", "witchbottle", false, 0), s("17764bb2", "stratum", false, 0)]
+    let mut erebus = s("aabbb6cd", "erebus", true, 2);
+    erebus.tasks = vec![
+        erebus_protocol::TaskInfo { id: "toolu_shell".into(), kind: TaskKind::Shell, label: "cargo".into(), started_unix_ms: vitals::CANNED_T0 },
+        erebus_protocol::TaskInfo { id: "toolu_mon".into(), kind: TaskKind::Monitor, label: "build log".into(), started_unix_ms: vitals::CANNED_T0 },
+    ];
+    vec![erebus, s("31616aa1", "witchbottle", false, 0), s("17764bb2", "stratum", false, 0)]
 }
 
 #[cfg(test)]
@@ -854,10 +1334,14 @@ mod tests {
 
     fn info(id: &str, busy: bool, workers: usize) -> SessionInfo {
         let mut s = canned().remove(0);
+        s.tasks.clear();
         s.id = id.into();
         s.label = id.into();
         s.status = if busy { SessionStatus::Busy } else { SessionStatus::Idle };
-        s.workers.truncate(workers);
+        let w0 = s.workers[0].clone();
+        s.workers = (0..workers)
+            .map(|i| erebus_protocol::WorkerInfo { id: format!("{id}-w{i}"), label: format!("w{}", i + 1), ..w0.clone() })
+            .collect();
         s
     }
 
@@ -893,7 +1377,16 @@ mod tests {
         assert_eq!(phase(&n, "a"), Some(Phase::Docked));
         assert_eq!(phase(&n, "b"), Some(Phase::Resting));
         assert!(dist(&n, "a") < dist(&n, "b"), "busy sits nearer the knot");
+        // Nothing pops in: they condense one after another, then the worker glides out.
+        assert!(n.globes.iter().all(|g| g.form <= 0.0));
+        let mut now = T0;
+        run(&mut n, CONDENSE * 0.5, &mut now);
+        let (a, b) = (get(&n, "a").unwrap().form, get(&n, "b").unwrap().form);
+        assert!(a > 0.3 && a < 0.7 && b < a - 0.1, "staggered: {a} {b}");
+        assert_eq!(n.globes[0].workers[0].form, 0.0, "the worker waits for its parent");
+        run(&mut n, CONDENSE * 0.5 + STAGGER + 0.1, &mut now);
         assert!(n.globes.iter().all(|g| g.form == 1.0));
+        run(&mut n, WORKER_EMERGE + 0.1, &mut now);
         assert_eq!(n.globes[0].workers[0].form, 1.0);
     }
 
@@ -989,6 +1482,479 @@ mod tests {
     }
 
     #[test]
+    fn a_codex_session_is_a_frost_wireframe_and_headless_is_smaller() {
+        let now = T0;
+        let mut n = net();
+        let mut cx = info("cx", true, 0);
+        cx.harness = "codex".into();
+        let mut ex = info("ex", true, 0);
+        ex.harness = "codex".into();
+        ex.headless = true;
+        n.ingest_sessions(&[cx, ex], now);
+        n.finish();
+        let f = n.frame(&area(), false).unwrap();
+        assert!(f.globes.is_empty(), "no particle globe for Codex");
+        let frost = theme::FROST.srgb_f32();
+        let is = |s: &Seg, c: [f32; 3]| (s.color[0] / s.color[3].max(1e-6) - c[0]).abs() < 0.01 && (s.color[2] / s.color[3].max(1e-6) - c[2]).abs() < 0.01;
+        assert!(f.segs.iter().filter(|s| s.width[1] == 0.0 && is(s, frost)).count() > 120, "frost wireframe and braid");
+        assert!(!f.segs.iter().any(|s| is(s, theme::EMBER.srgb_f32())), "nothing ember");
+        let (a, b) = (n.place(&n.globes[0], &area()).r, n.place(&n.globes[1], &area()).r);
+        let (busy, headless) = if n.globes[0].headless { (b, a) } else { (a, b) };
+        assert!(headless < busy * 0.9);
+    }
+
+    #[test]
+    fn a_docked_session_that_ends_dissolves_where_it_is() {
+        let mut now = T0;
+        let mut n = net();
+        n.ingest_sessions(&[info("a", true, 0)], now);
+        n.finish();
+        let d0 = dist(&n, "a");
+        n.ingest_sessions(&[], now);
+        let mut prev = 1.0;
+        while n.globes.iter().any(|g| g.id == "a") {
+            run(&mut n, 1.0 / 60.0, &mut now);
+            let Some(g) = get(&n, "a") else { break };
+            assert!((dist(&n, "a") - d0).abs() < 0.15, "it drifts while dissolving");
+            assert!(g.dim > 0.95, "it dims away instead of dissolving");
+            assert!(g.form <= prev && prev - g.form < 0.02);
+            prev = g.form;
+        }
+        assert!(prev < 0.05, "gone only once dissolved");
+    }
+
+    #[test]
+    fn a_moving_braid_end_closes_to_a_point() {
+        let spec = Braid { strands: 6, fibres: 4, lam: 118.0, amp: 9.0, om: 3.4, width: 1.25, alpha: 0.9, col: theme::EMBER };
+        let (a0, a1) = ([0.0, 0.0], [1000.0, 0.0]);
+        let mut out = Vec::new();
+        let tip = braid(&mut out, a0, a1, 0.0, 0.5, true, 1.0, &spec, &[], 1.0, 0.3, 7, false);
+        // The underglow narrows and fades into the tip, and no strand strays from the path
+        // near it.
+        let glow: Vec<&Seg> = out.iter().filter(|s| s.width[1] > 2.5).collect();
+        let (first, last) = (glow[glow.len() / 4], glow[glow.len() - 1]);
+        assert!(last.color[3] < first.color[3] * 0.2 && last.width[0] < first.width[0] * 0.5);
+        for s in out.iter().filter(|s| s.width[1] == 0.0) {
+            if s.ab[2] > tip[0] - 10.0 {
+                assert!(s.ab[3].abs() < 3.0, "a strand ends wide of the tip: {:?}", s.ab);
+            }
+        }
+    }
+
+    /// Worker `id` of globe 0: centre relative to its parent, and its form.
+    fn worker(n: &Net, id: &str) -> Option<([f32; 2], f32)> {
+        let g = &n.globes[0];
+        let p = n.place(g, &area());
+        let w = g.workers.iter().find(|w| w.id == id)?;
+        let wp = Net::worker_place(&p, g.scale, w.ang, e_in_out(w.emerge), &area());
+        Some(([wp.c[0] - p.c[0], wp.c[1] - p.c[1]], w.form))
+    }
+
+    #[test]
+    fn when_a_worker_leaves_it_dusts_in_place_and_the_rest_glide_over() {
+        let mut now = T0;
+        let mut n = net();
+        n.ingest_sessions(&[info("a", true, 4)], now);
+        n.finish();
+        run(&mut n, 0.1, &mut now);
+        let ids: Vec<String> = n.globes[0].workers.iter().map(|w| w.id.clone()).collect();
+        let (gone0, _) = worker(&n, &ids[1]).unwrap();
+        let mut s = info("a", true, 4);
+        s.workers.remove(1);
+        n.ingest_sessions(&[s], now);
+        let start = worker(&n, &ids[2]).unwrap().0;
+        let mut last = worker(&n, &ids[2]).unwrap().0;
+        for i in 0..(WORKER_DISSOLVE * 60.0) as u32 + 10 {
+            run(&mut n, 1.0 / 60.0, &mut now);
+            let c = worker(&n, &ids[2]).unwrap().0;
+            assert!(len([c[0] - last[0], c[1] - last[1]]) < 2.0, "the others jump at {i}");
+            last = c;
+            if let Some((c, f)) = worker(&n, &ids[1]) {
+                assert!(len([c[0] - gone0[0], c[1] - gone0[1]]) < 0.5, "the leaving one moves");
+                if (i as f32) < WORKER_DISSOLVE * 60.0 * 0.8 {
+                    assert!(f > 0.1, "it is gone too soon, at {i}");
+                }
+            }
+        }
+        assert!(worker(&n, &ids[1]).is_none());
+        assert!(len([last[0] - start[0], last[1] - start[1]]) > 5.0, "the others close the gap");
+    }
+
+    #[test]
+    fn a_worker_can_be_hovered_and_names_itself() {
+        let now = T0;
+        let mut n = net();
+        n.ingest_sessions(&[info("a", true, 1)], now);
+        n.finish();
+        let mut t = now;
+        run(&mut n, 0.1, &mut t);
+        let g = &n.globes[0];
+        let p = n.place(g, &area());
+        let w = &g.workers[0];
+        let wp = Net::worker_place(&p, g.scale, w.ang, 1.0, &area());
+        let id = w.id.clone();
+        assert_eq!(n.hit(&area(), wp.c[0], wp.c[1]), Some(id.clone()));
+        n.hover = Some(id);
+        run(&mut n, 1.0, &mut t);
+        let label = n.frame(&area(), false).unwrap().label.unwrap();
+        assert!(label.text.starts_with("a·w1 · "), "{}", label.text);
+    }
+
+    #[test]
+    fn a_workers_feed_row_rings_the_worker_not_its_parent() {
+        let mut now = T0;
+        let mut n = net();
+        n.ingest_sessions(&[info("a", true, 2)], now);
+        n.finish();
+        n.ping("a", Some("a-w1"));
+        assert!(n.globes[0].ping.is_none());
+        assert!(n.globes[0].workers[1].ping.is_some() && n.globes[0].workers[0].ping.is_none());
+        run(&mut n, 0.5, &mut now);
+        let label = n.frame(&area(), false).unwrap().label.unwrap();
+        assert!(label.text.starts_with("a·w2"), "{}", label.text);
+        // An unknown worker falls back to the session.
+        n.ping("a", Some("gone"));
+        assert!(n.globes[0].ping.is_some());
+        // The ring fades in.
+        assert!(ping_light(0.0, false) < 0.01 && ping_light(0.3, false) > 0.5);
+    }
+
+    use erebus_protocol::FeedKind;
+
+    fn ev(session: &str, worker: Option<&str>, kind: FeedKind, phrase: &str, backlog: bool) -> FeedEvent {
+        FeedEvent { unix_ms: T0, kind, phrase: phrase.into(), session: session.into(), worker: worker.map(str::to_owned), backlog }
+    }
+
+    fn docked_with_worker() -> (Net, u64) {
+        let mut now = T0;
+        let mut n = net();
+        n.ingest_sessions(&[info("a", true, 1)], now);
+        n.finish();
+        run(&mut n, 0.1, &mut now);
+        (n, now)
+    }
+
+    #[test]
+    fn events_pulse_the_braid_they_came_from_and_history_does_not() {
+        let (mut n, _) = docked_with_worker();
+        n.pulse(&[ev("a", None, FeedKind::Tool, "a · Bash cargo", true)]);
+        assert!(!n.globes[0].pulses.busy(), "backlog is history");
+        n.pulse(&[ev("a", Some("a-w0"), FeedKind::Tool, "a·w1 · Read x", false)]);
+        assert!(n.globes[0].workers[0].pulses.busy() && !n.globes[0].pulses.busy());
+        n.pulse(&[ev("a", None, FeedKind::Error, "a · Bash failed", false)]);
+        assert!(n.globes[0].pulses.busy());
+        let mut idle = net();
+        idle.ingest_sessions(&[info("b", false, 0)], T0);
+        idle.finish();
+        idle.pulse(&[ev("b", None, FeedKind::Tool, "b · Read", false)]);
+        assert!(!idle.globes[0].pulses.busy(), "a resting session has no braid to pulse");
+    }
+
+    #[test]
+    fn a_pulse_runs_globe_to_core_smoothly_and_rises_and_falls() {
+        let mut p = Pulses::default();
+        p.push(theme::VERM);
+        p.step(0.0, PULSE_SECS);
+        let (mut head, mut light) = (1.0f32, 0.0f32);
+        let mut peak = 0.0f32;
+        for i in 1..(PULSE_SECS * 60.0) as u32 {
+            p.step(1.0 / 60.0, PULSE_SECS);
+            let Some(l) = p.lit(PULSE_SECS, false).first().copied() else { break };
+            assert!(l.head <= head + 1e-6 && head - l.head < 0.03, "the head steps at {i}");
+            assert!((l.light - light).abs() < 0.15, "the light pops at {i}");
+            (head, light) = (l.head, l.light);
+            peak = peak.max(light);
+        }
+        assert!(head < 0.02 && light < 0.1 && peak > 0.95);
+    }
+
+    #[test]
+    fn pulses_ride_only_the_loose_fibres_in_the_events_colour() {
+        let spec = Braid { strands: 6, fibres: 4, lam: 118.0, amp: 9.0, om: 3.4, width: 1.25, alpha: 0.9, col: theme::EMBER };
+        let lit = [Lit { head: 0.5, light: 1.0, col: theme::VERM, whole: false }];
+        let (mut plain, mut pulsed) = (Vec::new(), Vec::new());
+        braid(&mut plain, [0.0, 0.0], [800.0, 0.0], 0.1, 1.0, false, 1.0, &spec, &[], 1.0, 0.4, 3, false);
+        braid(&mut pulsed, [0.0, 0.0], [800.0, 0.0], 0.1, 1.0, false, 1.0, &spec, &lit, 1.0, 0.4, 3, false);
+        let red: Vec<&Seg> = pulsed.iter().filter(|s| s.color[3] > 0.0 && (s.color[0] / s.color[3] - theme::VERM.srgb_f32()[0]).abs() < 0.01 && (s.color[1] / s.color[3] - theme::VERM.srgb_f32()[1]).abs() < 0.01).collect();
+        assert!(!red.is_empty());
+        // Every ember segment of the plain braid is still there, untouched: the pulse only adds.
+        let ember = |v: &Vec<Seg>| v.iter().filter(|s| (s.color[1] / s.color[3].max(1e-6) - theme::EMBER.srgb_f32()[1]).abs() < 0.01).count();
+        assert_eq!(ember(&plain), ember(&pulsed));
+        // Lit only near the head and behind it, toward the globe end.
+        for s in red.iter().filter(|s| s.width[1] == 0.0) {
+            let x = (s.ab[0] + s.ab[2]) / 2.0;
+            assert!(x > 400.0 - 20.0 && x < 400.0 + PULSE_TAIL * 2.0 + 20.0, "lit away from the head at {x}");
+        }
+        // Each lit segment lies on a fibre: wider than any strand's offset at that point.
+        let strand_reach = 9.0 * 2.0;
+        assert!(red.iter().filter(|s| s.width[1] == 0.0).any(|s| s.ab[1].abs() > strand_reach), "pulses ride the outer fibres");
+    }
+
+    #[test]
+    fn the_fibres_flow_toward_the_core_and_the_strands_do_not() {
+        // A crest's position along the path, a little later.
+        let spec = Braid { strands: 1, fibres: 1, lam: 118.0, amp: 9.0, om: 3.4, width: 1.25, alpha: 0.9, col: theme::EMBER };
+        let wave = |twist: f32, fibre: bool| {
+            let mut out = Vec::new();
+            braid(&mut out, [0.0, 0.0], [2000.0, 0.0], 0.0, 1.0, false, 1.0, &spec, &[], 1.0, twist, 0, false);
+            let segs: Vec<&Seg> = out.iter().filter(|s| s.width[1] == 0.0).collect();
+            let half = segs.len() / 2;
+            let part = if fibre { &segs[half..] } else { &segs[..half] };
+            // Every crest along the middle of the path.
+            part.windows(2).filter(|w| w[0].ab[0] > 600.0 && w[0].ab[0] < 1400.0 && w[0].ab[1] < w[0].ab[3] && w[1].ab[1] >= w[1].ab[3]).map(|w| w[0].ab[2]).collect::<Vec<f32>>()
+        };
+        // Follow one crest: the one nearest where it was a moment before.
+        let moved = |fibre: bool| {
+            let c0 = wave(0.0, fibre)[0];
+            let c1 = wave(0.02, fibre).into_iter().min_by(|a, b| (a - c0).abs().total_cmp(&(b - c0).abs())).unwrap();
+            c1 - c0
+        };
+        assert!(moved(true) < 0.0, "the fibre's crest moves toward the core");
+        assert!(moved(false) > 0.0, "the strand's crest moves toward the globe");
+    }
+
+    #[test]
+    fn same_instant_events_queue_in_feed_order() {
+        let (mut n, mut now) = docked_with_worker();
+        let burst = [
+            ev("a", None, FeedKind::Tool, "a · Bash cargo", false),
+            ev("a", None, FeedKind::Error, "a · Bash failed", false),
+            ev("a", None, FeedKind::Result, "a · Bash ok", false),
+        ];
+        n.pulse(&burst);
+        let mut order = Vec::new();
+        let mut t = 0.0;
+        while order.len() < 3 && t < 3.0 {
+            run(&mut n, 1.0 / 60.0, &mut now);
+            t += 1.0 / 60.0;
+            for &(age, col) in &n.globes[0].pulses.live {
+                if age <= 1.0 / 60.0 + 1e-4 && !order.iter().any(|(c, _)| *c == col) {
+                    order.push((col, t));
+                }
+            }
+        }
+        assert_eq!(order.iter().map(|o| o.0).collect::<Vec<_>>(), vec![theme::EMBER, theme::VERM, theme::VERD]);
+        for w in order.windows(2) {
+            assert!(w[1].1 - w[0].1 >= PULSE_GAP - 0.02, "launched too close");
+        }
+    }
+
+    #[test]
+    fn the_queue_caps_and_drops_the_newest() {
+        let mut p = Pulses::default();
+        for _ in 0..PULSE_QUEUE {
+            assert!(p.push(theme::EMBER));
+        }
+        assert!(!p.push(theme::VERM));
+        assert_eq!(p.queue.len(), PULSE_QUEUE);
+        assert!(p.queue.iter().all(|c| *c == theme::EMBER));
+    }
+
+    #[test]
+    fn a_granted_permission_pulses_green() {
+        assert_eq!(crate::feed::pulse_color(&ev("a", None, FeedKind::Perm, "a · granted Bash", false)), theme::VERD);
+        assert_eq!(crate::feed::pulse_color(&ev("a", None, FeedKind::Perm, "a · denied Bash", false)), theme::VERM);
+    }
+
+    #[test]
+    fn a_quiet_worker_holds_its_idle_parent_near() {
+        let mut now = T0;
+        let mut n = net();
+        n.ingest_sessions(&[info("a", true, 1)], now);
+        n.finish();
+        // The session goes idle while its worker waits on a long job, saying nothing.
+        n.ingest_sessions(&[info("a", false, 1)], now);
+        now += RELEASE_AFTER * 3;
+        n.step(0.0, false, now);
+        run(&mut n, 2.0, &mut now);
+        assert_eq!(phase(&n, "a"), Some(Phase::Docked));
+        assert_eq!(n.globes[0].workers[0].form, 1.0, "the worker stays out");
+        // The worker finishing starts the release clock over; after that the idle lets it go.
+        n.ingest_sessions(&[info("a", false, 0)], now);
+        n.step(0.0, false, now);
+        assert_eq!(phase(&n, "a"), Some(Phase::Docked));
+        now += RELEASE_AFTER;
+        n.step(0.0, false, now);
+        assert_eq!(phase(&n, "a"), Some(Phase::Releasing));
+    }
+
+    fn with_tasks(id: &str, kinds: &[TaskKind]) -> SessionInfo {
+        let mut s = info(id, true, 0);
+        s.tasks = kinds
+            .iter()
+            .enumerate()
+            .map(|(i, k)| erebus_protocol::TaskInfo { id: format!("{id}-t{i}"), kind: *k, label: format!("job{i}"), started_unix_ms: T0 })
+            .collect();
+        s
+    }
+
+    /// Where reach `id` of globe 0 ends, relative to its globe, and how grown it is.
+    fn reach_at(n: &Net, id: &str) -> Option<([f32; 2], f32)> {
+        let g = &n.globes[0];
+        let p = n.place(g, &area());
+        let r = g.tasks.iter().find(|r| r.id == id)?;
+        let (_, to) = Net::reach_ends(&p, r, &area());
+        Some(([to[0] - p.c[0], to[1] - p.c[1]], r.form))
+    }
+
+    #[test]
+    fn a_task_reaches_out_slowly_and_unravels_when_done() {
+        let mut now = T0;
+        let mut n = net();
+        n.ingest_sessions(&[info("a", true, 0)], now);
+        n.finish();
+        n.ingest_sessions(&[with_tasks("a", &[TaskKind::Shell])], now);
+        let mut prev = 0.0;
+        for i in 0..(REACH_GROW * 60.0) as u32 + 5 {
+            run(&mut n, 1.0 / 60.0, &mut now);
+            let (_, f) = reach_at(&n, "a-t0").unwrap();
+            assert!(f >= prev && f - prev < 0.03, "a step at {i}");
+            prev = f;
+        }
+        assert_eq!(prev, 1.0);
+        n.ingest_sessions(&[info("a", true, 0)], now);
+        run(&mut n, REACH_UNRAVEL * 0.5, &mut now);
+        let (_, f) = reach_at(&n, "a-t0").unwrap();
+        assert!(f > 0.3 && f < 0.7, "unravelling, not gone: {f}");
+        run(&mut n, REACH_UNRAVEL, &mut now);
+        assert!(reach_at(&n, "a-t0").is_none());
+    }
+
+    #[test]
+    fn reaches_fan_above_and_below_and_glide_when_one_ends() {
+        let mut now = T0;
+        let mut n = net();
+        n.ingest_sessions(&[with_tasks("a", &[TaskKind::Shell, TaskKind::Monitor, TaskKind::Shell])], now);
+        n.finish();
+        run(&mut n, REACH_GROW + 0.2, &mut now);
+        let (a, b) = (reach_at(&n, "a-t0").unwrap().0, reach_at(&n, "a-t1").unwrap().0);
+        assert!(a[1] < 0.0 && b[1] > 0.0, "one above, one below");
+        // t0 and t2 share the upper side; t0 ending frees the slot nearest the top.
+        let mut s = with_tasks("a", &[TaskKind::Shell, TaskKind::Monitor, TaskKind::Shell]);
+        s.tasks.remove(0);
+        n.ingest_sessions(&[s], now);
+        let start = reach_at(&n, "a-t2").unwrap().0;
+        let mut last = start;
+        for i in 0..90 {
+            run(&mut n, 1.0 / 60.0, &mut now);
+            let c = reach_at(&n, "a-t2").unwrap().0;
+            assert!(len([c[0] - last[0], c[1] - last[1]]) < 3.0, "a jump at {i}");
+            last = c;
+        }
+        assert!(len([last[0] - start[0], last[1] - start[1]]) > 5.0, "it glides to the freed slot");
+    }
+
+    #[test]
+    fn a_reach_can_be_hovered_and_names_its_task() {
+        let mut now = T0;
+        let mut n = net();
+        n.ingest_sessions(&[with_tasks("a", &[TaskKind::Monitor])], now);
+        n.finish();
+        run(&mut n, REACH_GROW + 0.2, &mut now);
+        let g = &n.globes[0];
+        let p = n.place(g, &area());
+        let (_, to) = Net::reach_ends(&p, &g.tasks[0], &area());
+        assert_eq!(n.hit(&area(), to[0], to[1]).as_deref(), Some("a-t0"));
+        n.hover = Some("a-t0".into());
+        run(&mut n, 1.0, &mut now);
+        assert_eq!(n.frame(&area(), false).unwrap().label.unwrap().text, "a · monitor job0");
+    }
+
+    #[test]
+    fn a_running_task_pulls_its_idle_session_in_and_holds_it() {
+        let mut now = T0;
+        let mut n = net();
+        let mut s = with_tasks("a", &[TaskKind::Shell]);
+        s.status = SessionStatus::Idle;
+        n.ingest_sessions(&[info("a", false, 0)], now);
+        n.finish();
+        n.ingest_sessions(&[s], now);
+        run(&mut n, GROW + HAUL_MAX + 1.0, &mut now);
+        assert_eq!(phase(&n, "a"), Some(Phase::Docked));
+        now += RELEASE_AFTER * 2;
+        n.step(0.0, false, now);
+        assert_eq!(phase(&n, "a"), Some(Phase::Docked), "held while the shell runs");
+    }
+
+    /// Two docked sessions, the first carrying `workers` and `tasks`, with the second dropped
+    /// at `at` (knot radii), relative to the first. Returns how far the second ends up from
+    /// that spot after `secs`, and the most it moved in one frame.
+    fn shove(workers: usize, tasks: &[TaskKind], at: impl Fn(&Net) -> [f32; 2], secs: f32) -> (f32, f32) {
+        let mut now = T0;
+        let mut n = net();
+        let mut a = with_tasks("a", tasks);
+        a.workers = info("a", true, workers).workers;
+        n.ingest_sessions(&[a, info("b", true, 0)], now);
+        n.finish();
+        run(&mut n, REACH_GROW + 0.3, &mut now);
+        let spot = at(&n);
+        let start = [n.globes[0].p[0] + spot[0], n.globes[0].p[1] + spot[1]];
+        n.globes[1].p = start;
+        n.globes[1].v = [0.0; 2];
+        let mut last = start;
+        let mut most = 0.0f32;
+        for _ in 0..(secs * 60.0) as u32 {
+            run(&mut n, 1.0 / 60.0, &mut now);
+            let p = n.globes[1].p;
+            most = most.max(len([p[0] - last[0], p[1] - last[1]]));
+            last = p;
+        }
+        (len([last[0] - start[0], last[1] - start[1]]), most)
+    }
+
+    #[test]
+    fn a_worker_nudges_another_globe_aside_gently() {
+        let worker = |n: &Net| {
+            let g = &n.globes[0];
+            let w = &g.workers[0];
+            [WORKER_D * g.scale * w.ang.cos(), WORKER_D * g.scale * w.ang.sin()]
+        };
+        // The worker is part of its globe's body, as its own circle and its braid.
+        let mut n = net();
+        n.ingest_sessions(&[info("a", true, 1)], T0);
+        n.finish();
+        let g = &n.globes[0];
+        let body = g.shapes();
+        let w = worker(&n);
+        let at = [g.p[0] + w[0], g.p[1] + w[1]];
+        assert!(body.circles.iter().any(|(c, r)| len([c[0] - at[0], c[1] - at[1]]) < 1e-4 && (*r - WORKER_R * g.scale).abs() < 1e-4));
+        assert_eq!(body.segments.len(), 2, "the knot braid and the worker braid");
+        let (moved, most) = shove(1, &[], worker, 1.0);
+        assert!(moved > 0.15, "pushed off the worker: {moved}");
+        assert!(most < 0.05, "a shove, not a nudge: {most}");
+    }
+
+    #[test]
+    fn a_reach_end_nudges_another_globe_aside() {
+        let end = |n: &Net| {
+            let g = &n.globes[0];
+            let r = g.body();
+            let t = &g.tasks[0];
+            let out = r + REACH_LEN * r.max(SESSION_R * 0.5);
+            [out * t.ang.cos(), out * t.ang.sin()]
+        };
+        let (moved, _) = shove(0, &[TaskKind::Shell], end, 1.0);
+        assert!(moved > 0.1, "pushed off the reach's end: {moved}");
+    }
+
+    #[test]
+    fn a_braid_gives_way_more_gently_than_a_globe() {
+        // The same depth of overlap: a globe against a braid, and against another globe.
+        let r = SESSION_R;
+        let depth = 0.05;
+        let globe = Body { circles: vec![([0.0, 0.0], r)], segments: vec![] };
+        let braid = Body { circles: vec![], segments: vec![([-5.0, r + BRAID_HALF - depth], [5.0, r + BRAID_HALF - depth], BRAID_HALF, BRAID_GIVE)] };
+        let other = Body { circles: vec![([0.0, 2.0 * r + GAP - depth], r)], segments: vec![] };
+        let size = |c: Vec<([f32; 2], f32, f32)>| c.iter().map(|(p, on_a, _)| len(*p) * on_a).sum::<f32>();
+        let (off_braid, off_globe) = (size(contacts(&globe, &braid)), size(contacts(&globe, &other)));
+        assert!(off_braid > 0.0, "the braid still pushes");
+        assert!(off_braid < off_globe * 0.6, "but more gently: {off_braid} vs {off_globe}");
+        // A braid only pushes once touched.
+        let clear = Body { circles: vec![], segments: vec![([-5.0, r + BRAID_HALF + 0.01], [5.0, r + BRAID_HALF + 0.01], BRAID_HALF, BRAID_GIVE)] };
+        assert!(contacts(&globe, &clear).is_empty());
+    }
+
+    #[test]
     fn feed_activity_holds_a_session_near() {
         let mut now = T0;
         let mut n = net();
@@ -1052,12 +2018,63 @@ mod tests {
         let mut now = T0;
         let mut n = net();
         n.ingest_sessions(&[info("a", true, 0)], now);
+        n.finish();
         n.ingest_sessions(&[info("a", true, 1)], now);
         assert_eq!(n.globes[0].workers[0].form, 0.0);
-        run(&mut n, 1.0, &mut now);
+        run(&mut n, WORKER_EMERGE * 0.5, &mut now);
+        assert!(n.globes[0].workers[0].form < 1.0, "emergence is slow");
+        run(&mut n, WORKER_EMERGE * 0.5 + 0.1, &mut now);
         assert_eq!(n.globes[0].workers[0].form, 1.0);
         n.ingest_sessions(&[info("a", true, 0)], now);
-        run(&mut n, 1.0, &mut now);
+        run(&mut n, WORKER_DISSOLVE + 0.1, &mut now);
+        assert!(n.globes[0].workers.is_empty());
+    }
+
+    /// Where worker 0 of globe 0 is drawn, relative to its parent's centre, and its radius.
+    fn worker_at(n: &Net) -> ([f32; 2], f32) {
+        let g = &n.globes[0];
+        let p = n.place(g, &area());
+        let w = &g.workers[0];
+        let wp = Net::worker_place(&p, g.scale, w.ang, e_in_out(w.emerge), &area());
+        ([wp.c[0] - p.c[0], wp.c[1] - p.c[1]], wp.r)
+    }
+
+    #[test]
+    fn a_worker_glides_out_of_the_nucleus_without_steps() {
+        let mut now = T0;
+        let mut n = net();
+        n.ingest_sessions(&[info("a", true, 0)], now);
+        n.finish();
+        n.ingest_sessions(&[info("a", true, 1)], now);
+        let (c0, r0) = worker_at(&n);
+        assert!(len(c0) < 1e-3, "starts in the nucleus");
+        let (mut c, mut r, mut v) = (c0, r0, [0.0f32; 2]);
+        for _ in 0..(WORKER_EMERGE * 60.0) as u32 + 6 {
+            run(&mut n, 1.0 / 60.0, &mut now);
+            let (c1, r1) = worker_at(&n);
+            let v1 = [c1[0] - c[0], c1[1] - c[1]];
+            assert!(len([v1[0] - v[0], v1[1] - v[1]]) < 0.2, "the glide steps");
+            assert!(r1 >= r - 1e-4, "it only grows");
+            (c, r, v) = (c1, r1, v1);
+        }
+        assert!(r > r0 * 5.0, "a speck grows to full size");
+        assert_eq!(n.globes[0].workers[0].emerge, 1.0);
+    }
+
+    #[test]
+    fn a_done_worker_turns_to_dust_where_it_stands() {
+        let mut now = T0;
+        let mut n = net();
+        n.ingest_sessions(&[info("a", true, 1)], now);
+        n.finish();
+        let (c0, _) = worker_at(&n);
+        n.ingest_sessions(&[info("a", true, 0)], now);
+        run(&mut n, WORKER_DISSOLVE * 0.5, &mut now);
+        let w = &n.globes[0].workers[0];
+        assert!(w.form > 0.3 && w.form < 0.7, "dissolving, not gone");
+        let (c1, _) = worker_at(&n);
+        assert!(len([c1[0] - c0[0], c1[1] - c0[1]]) < 1.0, "it holds its place");
+        run(&mut n, WORKER_DISSOLVE, &mut now);
         assert!(n.globes[0].workers.is_empty());
     }
 
@@ -1068,7 +2085,9 @@ mod tests {
         n.ingest_sessions(&[info("a", false, 0)], now);
         n.ingest_sessions(&[info("a", false, 0), info("b", false, 0)], now);
         assert_eq!(get(&n, "b").unwrap().form, 0.0);
-        run(&mut n, 1.0, &mut now);
+        run(&mut n, CONDENSE * 0.5, &mut now);
+        assert!(get(&n, "b").unwrap().form < 0.6, "condensing is slow");
+        run(&mut n, CONDENSE * 0.5 + 0.1, &mut now);
         assert_eq!(get(&n, "b").unwrap().form, 1.0);
     }
 }

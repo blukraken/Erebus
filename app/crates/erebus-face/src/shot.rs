@@ -65,10 +65,20 @@ pub struct KnotShot {
     /// Scrolls the feed back this many rows and lets the wheel rest, so the live chip shows.
     pub feed_scroll: Option<f32>,
     /// Session globes. A sequence can flip the second session busy (the knot pulls it in)
-    /// and later let the first go, as if it had been idle past the release time.
+    /// and later let the first go, as if it had been idle past the release time. It can also
+    /// hold back the first session's workers until one time and finish them at another.
     pub sessions: Option<Vec<erebus_protocol::SessionInfo>>,
     pub sessions_busy_at: Option<f64>,
     pub sessions_release_at: Option<f64>,
+    pub sessions_workers_at: Option<f64>,
+    pub sessions_workers_done_at: Option<f64>,
+    /// Holds the last session back until it arrives, and ends it, as if its harness
+    /// started and closed.
+    pub sessions_arrive_at: Option<f64>,
+    pub sessions_end_at: Option<f64>,
+    /// Fires a canned burst of feed events at the first session: three at once (a tool, its
+    /// failure, an ok), then one from its first worker and a granted permission.
+    pub sessions_pulse_at: Option<f64>,
 }
 
 /// How far into a `--flare` the still is taken.
@@ -263,14 +273,32 @@ pub fn run(shot: &Shot) -> Result<(), String> {
     if let Some(a) = area {
         vnet.set_area(a);
     }
-    if let Some(s) = &k.sessions {
-        vnet.ingest_sessions(s, net_ms);
+    // The sessions as they stand `at` seconds in: the first one's workers between their
+    // start and finish times, the last session between its arrival and end.
+    let between = |at: f64, from: Option<f64>, to: Option<f64>| from.is_none_or(|t| at >= t) && to.is_none_or(|t| at < t);
+    let snapshot = |at: f64| {
+        k.sessions.clone().map(|mut s| {
+            if !between(at, k.sessions_workers_at, k.sessions_workers_done_at) {
+                if let Some(x) = s.first_mut() {
+                    x.workers.clear();
+                }
+            }
+            if !between(at, k.sessions_arrive_at, k.sessions_end_at) {
+                s.pop();
+            }
+            s
+        })
+    };
+    if let Some(s) = snapshot(0.0) {
+        vnet.ingest_sessions(&s, net_ms);
     }
     let net_frame = |n: &Net| n.frame(area.as_ref()?, k.reduced);
 
     let mut renderer = Renderer::new(&gpu.device, &gpu.queue, format);
     let Some(frames) = &shot.frames else {
         vpanel.snap();
+        // A still has no time to condense in, so its globes are shown fully formed.
+        vnet.finish();
         let vf = vt.frame(column.as_ref(), now_ms, (w, h), k.reduced);
         let pf = panel_frame(&vpanel, &vt);
         let ff = feed_frame(&feed);
@@ -326,6 +354,30 @@ pub fn run(shot: &Shot) -> Result<(), String> {
                 x.status = erebus_protocol::SessionStatus::Busy;
             }
             vnet.ingest_sessions(&s, net_ms);
+        }
+        let crossed = |t: Option<f64>| t.is_some_and(|t| at >= t && at - dt < t);
+        let times = [k.sessions_workers_at, k.sessions_workers_done_at, k.sessions_arrive_at, k.sessions_end_at];
+        if times.into_iter().any(crossed) {
+            vnet.ingest_sessions(&snapshot(at).unwrap_or_default(), net_ms);
+        }
+        let first = k.sessions.as_ref().and_then(|s| s.first());
+        if let (Some(t0), Some(s)) = (k.sessions_pulse_at, first) {
+            use erebus_protocol::{FeedEvent, FeedKind};
+            let ev = |kind, phrase: &str, worker: Option<&str>| FeedEvent {
+                unix_ms: net_ms,
+                kind,
+                phrase: format!("{} · {phrase}", s.label),
+                session: s.id.clone(),
+                worker: worker.map(str::to_owned),
+                backlog: false,
+            };
+            let w = s.workers.first().map(|w| w.id.as_str());
+            if crossed(Some(t0)) {
+                vnet.pulse(&[ev(FeedKind::Tool, "Bash cargo", None), ev(FeedKind::Error, "Bash failed", None), ev(FeedKind::Result, "Bash ok", None)]);
+            }
+            if crossed(Some(t0 + 2.5)) {
+                vnet.pulse(&[ev(FeedKind::Tool, "Read lib.rs", w), ev(FeedKind::Perm, "granted Bash", None)]);
+            }
         }
         if let Some(s) = k.sessions.as_ref().filter(|_| k.sessions_release_at.is_some_and(|t| at >= t && at - dt < t)) {
             let mut s = s.clone();

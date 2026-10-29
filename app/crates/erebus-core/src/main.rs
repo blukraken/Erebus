@@ -3,12 +3,14 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod codex;
 mod config;
 mod context;
 mod git;
 mod hub;
 mod icon;
 mod ids;
+mod labels;
 mod log;
 mod route;
 mod server;
@@ -75,7 +77,9 @@ async fn run(name: &str) -> ExitCode {
     let (quit_tx, quit_rx) = oneshot::channel();
     context::spawn(hub_tx.clone());
     sysmon::spawn(hub_tx.clone());
-    sessions::spawn(hub_tx.clone());
+    let labels = labels::Labels::default();
+    sessions::spawn(hub_tx.clone(), labels.clone());
+    codex::spawn(hub_tx.clone(), labels);
     hub::spawn(hub_rx, tray.as_ref().map(tray::Tray::hwnd), quit_tx);
 
     let mut serve = pin!(server::serve(first, name, server::now_ms(), hub_tx));

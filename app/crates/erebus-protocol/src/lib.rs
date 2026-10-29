@@ -62,14 +62,37 @@ pub struct SessionInfo {
     pub label: String,
     /// Working folder the session runs in.
     pub cwd: String,
-    /// "claude" for Claude Code.
+    /// "claude" for Claude Code, "codex" for Codex.
     pub harness: String,
+    /// Started by a script or tool, with no one at a terminal (`codex exec`).
+    #[serde(default)]
+    pub headless: bool,
     pub status: SessionStatus,
     pub started_unix_ms: u64,
     /// Workers the session spawned and still runs.
     pub workers: Vec<WorkerInfo>,
     /// A permission prompt waiting on the person, after a short settle.
     pub pending: Option<Pending>,
+    /// Background shells and monitors the session runs, oldest first.
+    #[serde(default)]
+    pub tasks: Vec<TaskInfo>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskInfo {
+    /// The tool call that started it.
+    pub id: String,
+    pub kind: TaskKind,
+    /// The program a shell runs, or what a monitor watches.
+    pub label: String,
+    pub started_unix_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskKind {
+    Shell,
+    Monitor,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -340,11 +363,18 @@ mod tests {
             label: "erebus".into(),
             cwd: r"F:\Projects\Erebus".into(),
             harness: "claude".into(),
+            headless: false,
             status: SessionStatus::Busy,
             started_unix_ms: 1_000,
             workers: vec![WorkerInfo { id: "a2f6".into(), label: "w1".into(), kind: "Explore".into(), started_unix_ms: 2_000 }],
             pending: Some(Pending { tool_use_id: "toolu_1".into(), tool: "Bash".into(), worker: None, since_unix_ms: 3_000 }),
+            tasks: vec![TaskInfo { id: "toolu_2".into(), kind: TaskKind::Monitor, label: "build log".into(), started_unix_ms: 2_500 }],
         };
+        // A snapshot from before tasks still reads, with none.
+        let mut old = serde_json::to_value(&session).unwrap();
+        old.as_object_mut().unwrap().remove("tasks");
+        let back: SessionInfo = serde_json::from_value(old).unwrap();
+        assert!(back.tasks.is_empty());
         let event = FeedEvent {
             unix_ms: 4_000,
             kind: FeedKind::Tool,

@@ -57,6 +57,16 @@ pub fn color(kind: FeedKind) -> Rgb {
     }
 }
 
+/// A pulse's colour on the braids: the row's colour, except a granted permission reads as
+/// settled verdigris, not as a failure.
+pub fn pulse_color(ev: &FeedEvent) -> Rgb {
+    if ev.kind == FeedKind::Perm && ev.phrase.contains("granted") {
+        theme::VERD
+    } else {
+        color(ev.kind)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Row {
     id: u64,
@@ -156,6 +166,11 @@ impl Feed {
     /// The session a row came from.
     pub fn session_of(&self, id: u64) -> Option<&str> {
         self.rows.iter().find(|r| r.id == id).map(|r| r.ev.session.as_str())
+    }
+
+    /// The worker a row came from, when a worker said it.
+    pub fn worker_of(&self, id: u64) -> Option<&str> {
+        self.rows.iter().find(|r| r.id == id).and_then(|r| r.ev.worker.as_deref())
     }
 
     /// Glides back to the live end.

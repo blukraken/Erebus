@@ -43,8 +43,9 @@ pub enum Event {
     Hardware(Hardware),
     /// One second of vitals.
     Vitals(Sample),
-    /// Every live session. Faces hear about it only when it differs.
-    Sessions(Vec<SessionInfo>),
+    /// Every live session one adapter follows, keyed by harness. Faces get every adapter's
+    /// sessions merged, and only when the merge differs.
+    Sessions(&'static str, Vec<SessionInfo>),
     /// New feed events, oldest first.
     Feed(Vec<FeedEvent>),
 }
@@ -69,6 +70,7 @@ async fn run(
     let mut hw: Option<Hardware> = None;
     let mut ring: VecDeque<Sample> = VecDeque::with_capacity(VITALS_HISTORY);
     let mut sessions: Option<Vec<SessionInfo>> = None;
+    let mut by_harness: std::collections::BTreeMap<&'static str, Vec<SessionInfo>> = std::collections::BTreeMap::new();
     let mut feed: VecDeque<FeedEvent> = VecDeque::with_capacity(FEED_HISTORY);
     let publish = |n: usize| {
         if let Some(hwnd) = tray {
@@ -131,7 +133,10 @@ async fn run(
                     }
                 }
             }
-            Event::Sessions(next) => {
+            Event::Sessions(harness, list) => {
+                by_harness.insert(harness, list);
+                let mut next: Vec<SessionInfo> = by_harness.values().flatten().cloned().collect();
+                next.sort_by(|a, b| (a.started_unix_ms, &a.label).cmp(&(b.started_unix_ms, &b.label)));
                 if sessions.as_ref() == Some(&next) {
                     continue;
                 }

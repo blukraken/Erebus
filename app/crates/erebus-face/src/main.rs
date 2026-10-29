@@ -29,7 +29,11 @@
 //! `--feed-scroll <rows>` scrolls it back that far, showing the live chip.
 //! `--sessions <json>|canned` shows session globes from a JSON array of protocol
 //! `SessionInfo`; in a sequence `--sessions-busy-at <s>` turns the second session busy and
-//! `--sessions-release-at <s>` lets the first go.
+//! `--sessions-release-at <s>` lets the first go. `--sessions-workers-at <s>` holds the first
+//! session's workers back until then, and `--sessions-workers-done-at <s>` finishes them.
+//! `--sessions-arrive-at <s>` holds the last session back until then, and
+//! `--sessions-end-at <s>` ends it. `--sessions-pulse-at <s>` fires a canned burst of feed
+//! pulses at the first session.
 //!
 //! `--frames <dir> [--duration <s>] [--fps <n>]` replaces the still with a consecutive
 //! sequence, `dir/frame_00000.png` onward, stepping the clock 1/fps per frame from `--time`.
@@ -37,6 +41,7 @@
 //! `--commit-at` fires the commit that many seconds into the sequence.
 
 mod app;
+mod codex;
 mod feed;
 mod files;
 mod globes;
@@ -47,6 +52,7 @@ mod link;
 mod logfile;
 mod net;
 mod panel;
+mod reach;
 mod render;
 mod shot;
 mod vitals;
@@ -60,7 +66,7 @@ const USAGE: &str = "usage: erebus-face [--windowed] [--trace] [--idle-present <
                      [--close-hover|--close-press] [--windowed-chrome] [--context <json>] [--time <s>] \
                      [--hover-knot] [--flare branch|head|changed] [--glance] [--reduced-motion] [--bench <n>] \
                      [--files <json>] [--commit-at <s>] [--commit-count <n>] [--hover-file <path>] \
-                     [--crop WxH[+X+Y]] [--zoom <n>] [--no-vitals] [--hover-vital ram|gpu|cpu] \n                     [--vitals-panel ram|gpu|cpu] [--feed <json>|canned] [--feed-scroll <rows>]                      [--sessions <json>|canned] [--sessions-busy-at <s>] [--sessions-release-at <s>] \
+                     [--crop WxH[+X+Y]] [--zoom <n>] [--no-vitals] [--hover-vital ram|gpu|cpu] \n                     [--vitals-panel ram|gpu|cpu] [--feed <json>|canned] [--feed-scroll <rows>]                      [--sessions <json>|canned] [--sessions-busy-at <s>] [--sessions-release-at <s>]                      [--sessions-workers-at <s>] [--sessions-workers-done-at <s>] [--sessions-arrive-at <s>] [--sessions-end-at <s>] [--sessions-pulse-at <s>] \
                      | --frames <dir> [--duration <s>] [--fps <n>] [screenshot options]";
 
 fn parse_size(flag: &str, v: &str) -> Result<(u32, u32), String> {
@@ -190,6 +196,11 @@ fn parse(args: &[String]) -> Result<Mode, String> {
             }
             "--sessions-busy-at" => knot.sessions_busy_at = Some(parse_secs(a, value()?, 0.0..=600.0)?),
             "--sessions-release-at" => knot.sessions_release_at = Some(parse_secs(a, value()?, 0.0..=600.0)?),
+            "--sessions-workers-at" => knot.sessions_workers_at = Some(parse_secs(a, value()?, 0.0..=600.0)?),
+            "--sessions-workers-done-at" => knot.sessions_workers_done_at = Some(parse_secs(a, value()?, 0.0..=600.0)?),
+            "--sessions-arrive-at" => knot.sessions_arrive_at = Some(parse_secs(a, value()?, 0.0..=600.0)?),
+            "--sessions-end-at" => knot.sessions_end_at = Some(parse_secs(a, value()?, 0.0..=600.0)?),
+            "--sessions-pulse-at" => knot.sessions_pulse_at = Some(parse_secs(a, value()?, 0.0..=600.0)?),
             "--palette" => view.palette = true,
             "--link" => {
                 view.link = match value()?.as_str() {

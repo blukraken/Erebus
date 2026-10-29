@@ -43,7 +43,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use erebus_protocol::{
-    FeedEvent, FeedKind, Pending, SessionInfo, SessionStatus, WorkerInfo, FEED_HISTORY, MAX_PHRASE,
+    FeedEvent, FeedKind, Pending, SessionInfo, SessionStatus, TaskInfo, TaskKind, WorkerInfo, FEED_HISTORY, MAX_PHRASE,
 };
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::de::{Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
@@ -51,17 +51,20 @@ use serde::Deserialize;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::hub::Event;
+use crate::labels::Labels;
 use crate::log::{log_info, log_warn};
 use crate::server::now_ms;
 
+const HARNESS: &str = "claude";
+
 /// How long a pass waits after the first file change, gathering the rest of the burst.
-const WINDOW: Duration = Duration::from_millis(250);
+pub(crate) const WINDOW: Duration = Duration::from_millis(250);
 
 /// A pass runs at least this often.
-const RESCAN: Duration = Duration::from_secs(2);
+pub(crate) const RESCAN: Duration = Duration::from_secs(2);
 
 /// History read from a file the core sees for the first time.
-const SEED_BYTES: u64 = 512 * 1024;
+pub(crate) const SEED_BYTES: u64 = 512 * 1024;
 
 /// A file created this close to its session's start counts as new, not history.
 const BIRTH_SLACK_MS: u64 = 5_000;
@@ -76,7 +79,7 @@ const SPOOL_GIVE_UP_MS: u64 = 2_000;
 const SPOOL_RETRY: Duration = Duration::from_millis(250);
 
 /// A tool that ran at least this long gets a `result` line.
-const LONG_TOOL_MS: u64 = 10_000;
+pub(crate) const LONG_TOOL_MS: u64 = 10_000;
 
 /// A live worker whose transcript has not grown for this long is dropped.
 const STALE_WORKER_MS: u64 = 30 * 60 * 1000;
@@ -99,16 +102,16 @@ const KEPT: &[&str] = &["user", "assistant", "system", "attachment"];
 const INTERRUPT: &str = "[Request interrupted by user";
 const DECLINED: &str = "The user doesn't want to proceed";
 
-pub fn spawn(hub: UnboundedSender<Event>) {
-    let spawned = thread::Builder::new().name("sessions".into()).spawn(move || run(hub));
+pub fn spawn(hub: UnboundedSender<Event>, labels: Labels) {
+    let spawned = thread::Builder::new().name("sessions".into()).spawn(move || run(hub, labels));
     if let Err(e) = spawned {
         log_warn!("cannot start sessions service: {e}");
     }
 }
 
-fn run(hub: UnboundedSender<Event>) {
+fn run(hub: UnboundedSender<Event>, labels: Labels) {
     let (tx, rx) = mpsc::channel();
-    let mut svc = Service::new(Paths::from_env());
+    let mut svc = Service::new(Paths::from_env(), labels);
     let mut watch = Watch { tx, w: None, watched: Vec::new(), warned: false };
     let mut window: Option<Instant> = None;
     let mut next_scan = Instant::now();
@@ -134,7 +137,7 @@ fn run(hub: UnboundedSender<Event>) {
         watch.ensure(&svc.paths);
         let (sessions, feed) = svc.pass(now_ms());
         if let Some(s) = sessions {
-            if hub.send(Event::Sessions(s)).is_err() {
+            if hub.send(Event::Sessions(HARNESS, s)).is_err() {
                 return;
             }
         }
@@ -229,7 +232,7 @@ fn matters(p: &Path) -> bool {
 
 /// How a batch of lines reaches the feed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Mode {
+pub(crate) enum Mode {
     /// History read when the core first saw the file.
     Backlog,
     Live,
@@ -239,13 +242,13 @@ enum Mode {
 
 /// Feed events gathered during one pass.
 #[derive(Default)]
-struct Out {
+pub(crate) struct Out {
     backlog: Vec<FeedEvent>,
     live: Vec<FeedEvent>,
 }
 
 impl Out {
-    fn push(&mut self, mode: Mode, event: FeedEvent) {
+    pub(crate) fn push(&mut self, mode: Mode, event: FeedEvent) {
         match mode {
             Mode::Backlog => self.backlog.push(event),
             Mode::Live => self.live.push(event),
@@ -255,7 +258,7 @@ impl Out {
 
     /// Backlog first, trimmed to what the hub's ring can hold, then live events. Each part is
     /// sorted by time; a stable sort keeps file order within a millisecond.
-    fn finish(mut self) -> Vec<FeedEvent> {
+    pub(crate) fn finish(mut self) -> Vec<FeedEvent> {
         self.backlog.sort_by_key(|e| e.unix_ms);
         let cut = self.backlog.len().saturating_sub(FEED_HISTORY);
         self.backlog.drain(..cut);
@@ -281,12 +284,14 @@ struct Service {
     counts: (usize, usize),
     /// When the next pass must run regardless of file changes.
     wake: Option<Instant>,
+    labels: Labels,
 }
 
 impl Service {
-    fn new(paths: Paths) -> Service {
+    fn new(paths: Paths, labels: Labels) -> Service {
         Service {
             paths,
+            labels,
             sessions: Vec::new(),
             asks: Asks::default(),
             unreadable: HashMap::new(),
@@ -377,15 +382,18 @@ impl Service {
         fresh.sort_by_key(|f| (f.started_ms(), f.pid));
         for f in fresh {
             let label = relabel.remove(&f.pid).unwrap_or_else(|| {
-                let taken: Vec<&str> = self.sessions.iter().map(|s| s.label.as_str()).collect();
-                allocate(&base_label(f.cwd.as_deref().unwrap_or("")), &taken)
+                let others = self.labels.others(HARNESS);
+                let taken: Vec<&str> = self.sessions.iter().map(|s| s.label.as_str()).chain(others.iter().map(String::as_str)).collect();
+                allocate(&base_label(f.cwd.as_deref().unwrap_or(""), "claude"), &taken)
             });
             let s = Session::new(f, label, !first, now);
             let mode = if first { Mode::Backlog } else { Mode::Live };
             s.emit(out, mode, s.started_ms, FeedKind::Session, None, "started");
             log_info!("session started: {} pid {}", s.label, s.pid);
             self.sessions.push(s);
+            self.labels.set(HARNESS, self.sessions.iter().map(|s| s.label.clone()).collect());
         }
+        self.labels.set(HARNESS, self.sessions.iter().map(|s| s.label.clone()).collect());
 
         for s in &mut self.sessions {
             if let Some(f) = found.iter().find(|f| f.pid == s.pid) {
@@ -523,7 +531,7 @@ fn status_of_str(s: Option<&str>) -> SessionStatus {
 }
 
 /// Session and agent ids become path components, so only plain ids are accepted.
-fn safe_id(s: &str) -> bool {
+pub(crate) fn safe_id(s: &str) -> bool {
     !s.is_empty() && s.len() <= 128 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
@@ -568,6 +576,17 @@ struct Call {
     ms: u64,
     /// The task a TaskStop or KillShell call targets.
     stop: Option<String>,
+    /// What the call runs, for a background task's name.
+    label: String,
+}
+
+/// A background shell or monitor, live from the result that names it.
+#[derive(Clone, Debug)]
+struct Task {
+    task_id: String,
+    kind: TaskKind,
+    label: String,
+    started_ms: u64,
 }
 
 struct Agent {
@@ -602,7 +621,7 @@ struct Session {
     /// Agent calls that finished before their worker was seen.
     ended_spawns: HashSet<String>,
     /// Live background tasks of the main transcript, by the tool call that started each.
-    tasks: HashMap<String, String>,
+    tasks: HashMap<String, Task>,
     /// Tool calls that already have a perm line.
     perms: HashSet<String>,
     /// The main transcript has shown activity since its last turn end.
@@ -679,7 +698,8 @@ impl Session {
             id: self.id.clone(),
             label: self.label.clone(),
             cwd: self.cwd.clone(),
-            harness: "claude".into(),
+            harness: HARNESS.into(),
+            headless: false,
             status: self.status,
             started_unix_ms: self.started_ms,
             workers: workers
@@ -692,6 +712,15 @@ impl Session {
                 })
                 .collect(),
             pending,
+            tasks: {
+                let mut t: Vec<TaskInfo> = self
+                    .tasks
+                    .iter()
+                    .map(|(id, t)| TaskInfo { id: id.clone(), kind: t.kind, label: t.label.clone(), started_unix_ms: t.started_ms })
+                    .collect();
+                t.sort_by(|a, b| (a.started_unix_ms, &a.id).cmp(&(b.started_unix_ms, &b.id)));
+                t
+            },
         }
     }
 
@@ -843,7 +872,7 @@ impl Session {
     /// Ends the background task with id `task_id`.
     fn end_task_id(&mut self, task_id: &str, ms: u64, mode: Mode, out: &mut Out) {
         let before = self.tasks.len();
-        self.tasks.retain(|_, t| t != task_id);
+        self.tasks.retain(|_, t| t.task_id != task_id);
         if self.tasks.len() != before {
             self.settle(out, mode, ms);
         }
@@ -898,8 +927,14 @@ impl Session {
                     self.turn_ended(pending, ms, mode, out);
                 }
             }
-            Fact::Call { id, tool, act, stop } => {
-                self.calls.insert(id, Call { tool, ms, stop });
+            Fact::Call { id, tool, act, stop, desc } => {
+                let label = match (&act, desc) {
+                    (_, Some(d)) if tool == "Monitor" => clip(&d, 24),
+                    (Act::Tool(what), _) => what.strip_prefix(tool.as_str()).map_or(what.as_str(), str::trim).to_owned(),
+                    _ => tool.clone(),
+                };
+                let label = if label.is_empty() { tool.clone() } else { label };
+                self.calls.insert(id, Call { tool, ms, stop, label });
                 match act {
                     Act::Tool(what) => self.emit(out, mode, ms, FeedKind::Tool, agent, &what),
                     Act::Spawn(kind) => self.emit(out, mode, ms, FeedKind::Spawn, agent, &format!("spawned {kind}")),
@@ -910,6 +945,8 @@ impl Session {
                 asks.resolve(&id, ms);
                 let call = self.calls.remove(&id);
                 let tool = call.as_ref().map_or("tool", |c| c.tool.as_str()).to_owned();
+                let label = call.as_ref().map_or_else(|| tool.clone(), |c| c.label.clone());
+                let started = call.as_ref().map_or(ms, |c| c.ms);
                 let stop = call.as_ref().and_then(|c| c.stop.clone());
                 if let Some(d) = decision {
                     let person = d.source.starts_with("user");
@@ -940,7 +977,8 @@ impl Session {
                         self.end_task_id(&task, ms, mode, out);
                     } else if let Some(task) = bg_task.or_else(|| monitor_task.filter(|_| tool == "Monitor")) {
                         if !error {
-                            self.tasks.insert(id, task);
+                            let kind = if tool == "Monitor" { TaskKind::Monitor } else { TaskKind::Shell };
+                            self.tasks.insert(id, Task { task_id: task, kind, label, started_ms: started });
                         }
                     }
                 }
@@ -992,7 +1030,7 @@ pub fn slug(cwd: &str) -> String {
     cwd.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect()
 }
 
-fn file_len(p: &Path) -> Option<u64> {
+pub(crate) fn file_len(p: &Path) -> Option<u64> {
     fs::metadata(p).ok().map(|m| m.len())
 }
 
@@ -1004,7 +1042,7 @@ fn mtime_ms(p: &Path) -> Option<u64> {
     fs::metadata(p).and_then(|m| m.modified()).ok().and_then(to_ms)
 }
 
-fn created_ms(p: &Path) -> Option<u64> {
+pub(crate) fn created_ms(p: &Path) -> Option<u64> {
     fs::metadata(p).and_then(|m| m.created()).ok().and_then(to_ms)
 }
 
@@ -1098,7 +1136,7 @@ struct SpoolRec {
 }
 
 /// Reads a file from a byte offset, one batch of complete lines at a time.
-struct Tail {
+pub(crate) struct Tail {
     path: PathBuf,
     offset: u64,
     lines: LineBuf,
@@ -1113,7 +1151,7 @@ struct Tail {
 
 impl Tail {
     /// Starts at the last [`SEED_BYTES`] as backlog when `seed`, else at the start as live.
-    fn open(path: PathBuf, seed: bool) -> Tail {
+    pub(crate) fn open(path: PathBuf, seed: bool) -> Tail {
         let (offset, next) = if seed { (file_len(&path).unwrap_or(0).saturating_sub(SEED_BYTES), Mode::Backlog) } else { (0, Mode::Live) };
         let lines = LineBuf { partial: Vec::new(), skip: offset > 0 };
         Tail { path, offset, lines, next, aborted: false, last_ms: 0, grew_ms: 0 }
@@ -1126,7 +1164,7 @@ impl Tail {
 
     /// New complete lines and how to report them. A file shorter than the offset was truncated
     /// or replaced: it is read again from the start without feed lines.
-    fn read(&mut self, now: u64) -> (Vec<u8>, Mode) {
+    pub(crate) fn read(&mut self, now: u64) -> (Vec<u8>, Mode) {
         let Ok(mut f) = File::open(&self.path) else { return (Vec::new(), Mode::Live) };
         let Ok(len) = f.metadata().map(|m| m.len()) else { return (Vec::new(), Mode::Live) };
         let mut mode = self.next;
@@ -1152,7 +1190,7 @@ impl Tail {
 
 /// Splits a byte stream into whole lines, holding back a trailing line without `\n`.
 #[derive(Default)]
-struct LineBuf {
+pub(crate) struct LineBuf {
     partial: Vec<u8>,
     /// Drop everything up to the first `\n`: reading started mid-line.
     skip: bool,
@@ -1217,7 +1255,8 @@ fn scan(tail: &mut Tail, block: &[u8], now: u64, stats: &mut Stats) -> Vec<(Fact
 /// What one transcript line reports.
 #[derive(Clone, Debug, PartialEq)]
 enum Fact {
-    Call { id: String, tool: String, act: Act, stop: Option<String> },
+    /// `desc` is the call's own description, kept for a Monitor's name.
+    Call { id: String, tool: String, act: Act, stop: Option<String>, desc: Option<String> },
     /// `bg_task` and `monitor_task` are the task ids a result names, if any.
     Return {
         id: String,
@@ -1302,7 +1341,8 @@ fn parse_line(line: &[u8]) -> Line {
                     let input = b.input.unwrap_or_default();
                     let act = act_of(&tool, &input);
                     let stop = matches!(tool.as_str(), "TaskStop" | "KillShell").then(|| input.task_id.or(input.shell_id)).flatten();
-                    facts.push(Fact::Call { id, tool, act, stop });
+                    let desc = input.description.as_deref().map(tidy).filter(|d| !d.is_empty());
+                    facts.push(Fact::Call { id, tool, act, stop, desc });
                 }
             }
             true
@@ -1489,6 +1529,8 @@ struct Input {
     task_id: Option<String>,
     #[serde(default, deserialize_with = "loose_str")]
     shell_id: Option<String>,
+    #[serde(default, deserialize_with = "loose_str")]
+    description: Option<String>,
 }
 
 /// `message.content`: a plain string or a list of blocks.
@@ -1793,7 +1835,7 @@ fn snippet<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> 
 }
 
 /// `2026-10-14T17:52:19.999Z` as unix milliseconds. UTC only.
-fn parse_ts(s: &str) -> Option<u64> {
+pub(crate) fn parse_ts(s: &str) -> Option<u64> {
     let b = s.as_bytes();
     if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
         return None;
@@ -1827,12 +1869,12 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 }
 
 /// `<who> · <what>`, cut to [`MAX_PHRASE`] characters.
-fn phrase(who: &str, what: &str) -> String {
+pub(crate) fn phrase(who: &str, what: &str) -> String {
     clip(&format!("{who} · {what}"), MAX_PHRASE)
 }
 
 /// At most `max` characters, ending in `…` when cut. Never splits a character.
-fn clip(s: &str, max: usize) -> String {
+pub(crate) fn clip(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_owned();
     }
@@ -1846,7 +1888,7 @@ fn tidy(s: &str) -> String {
     s.split(|c: char| c.is_whitespace() || c.is_control()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" ")
 }
 
-fn basename(p: &str) -> &str {
+pub(crate) fn basename(p: &str) -> &str {
     let p = p.trim().trim_end_matches(['/', '\\']);
     p.rsplit(['/', '\\']).next().unwrap_or(p)
 }
@@ -1854,7 +1896,7 @@ fn basename(p: &str) -> &str {
 /// The program a shell command runs, without a path or `.exe`: the first word of the first
 /// statement that runs one. Statements that assign or evaluate (`$x = …`, `1..3 | …`) and loop
 /// or branch headers are passed over.
-fn command_name(cmd: &str) -> Option<String> {
+pub(crate) fn command_name(cmd: &str) -> Option<String> {
     cmd.split([';', '|', '\n']).find_map(statement_name)
 }
 
@@ -1919,7 +1961,7 @@ fn host(url: &str) -> Option<&str> {
 }
 
 /// `mcp__server__tool` as `server tool`.
-fn mcp(tool: &str) -> Option<String> {
+pub(crate) fn mcp(tool: &str) -> Option<String> {
     let parts: Vec<&str> = tool.strip_prefix("mcp__")?.split("__").filter(|p| !p.is_empty()).collect();
     match parts.as_slice() {
         [server, .., name] => Some(format!("{server} {name}")),
@@ -1953,17 +1995,17 @@ fn act_of(tool: &str, input: &Input) -> Act {
 }
 
 /// Lowercase last folder of a cwd, e.g. `erebus` for `F:\Projects\Erebus`.
-fn base_label(cwd: &str) -> String {
+pub(crate) fn base_label(cwd: &str, fallback: &str) -> String {
     let name = tidy(basename(cwd).trim_end_matches(':')).to_lowercase();
     if name.is_empty() {
-        "claude".into()
+        fallback.into()
     } else {
         name
     }
 }
 
 /// `base`, or `base-2`, `base-3`… for the first one no live session holds.
-fn allocate(base: &str, taken: &[&str]) -> String {
+pub(crate) fn allocate(base: &str, taken: &[&str]) -> String {
     (1..)
         .map(|n| if n == 1 { base.to_owned() } else { format!("{base}-{n}") })
         .find(|l| !taken.contains(&l.as_str()))
@@ -2306,6 +2348,23 @@ mod tests {
     }
 
     #[test]
+    fn shells_and_monitors_reach_the_snapshot_named_and_leave_it_when_done() {
+        let mut s = session("alpha");
+        let mut lines = shell("b1", "t1", 1000).to_vec();
+        lines.push(call("m1", "Monitor", r#"{"command":"tail -f build.log","description":"build log","timeout_ms":60000}"#, 2000));
+        lines.push(result("m1", false, r#","toolUseResult":{"taskId":"m9","timeoutMs":60000,"persistent":false}"#, 2001));
+        feed(&mut s, &lines);
+        let tasks = s.info(None).tasks;
+        assert_eq!(tasks.len(), 2);
+        assert_eq!((tasks[0].kind, tasks[0].label.as_str(), tasks[0].id.as_str()), (TaskKind::Shell, "sleep", "b1"));
+        assert_eq!((tasks[1].kind, tasks[1].label.as_str()), (TaskKind::Monitor, "build log"));
+        assert_eq!(tasks[0].started_unix_ms, parse_ts(&ts(1000)).unwrap());
+        feed(&mut s, &[note("t1", "b1", "completed", 3000)]);
+        let tasks = s.info(None).tasks;
+        assert_eq!(tasks.iter().map(|t| t.kind).collect::<Vec<_>>(), [TaskKind::Monitor]);
+    }
+
+    #[test]
     fn background_result_names_its_task() {
         let line = started("b1", "t1", 1000);
         let Line::Kept { facts, .. } = parse_line(line.as_bytes()) else { panic!("not kept") };
@@ -2632,10 +2691,10 @@ mod tests {
 
     #[test]
     fn labels_take_suffixes_in_start_order() {
-        assert_eq!(base_label(r"F:\Projects\Erebus"), "erebus");
-        assert_eq!(base_label("/home/me/My Repo/"), "my repo");
-        assert_eq!(base_label(r"C:\"), "c");
-        assert_eq!(base_label(""), "claude");
+        assert_eq!(base_label(r"F:\Projects\Erebus", "claude"), "erebus");
+        assert_eq!(base_label("/home/me/My Repo/", "claude"), "my repo");
+        assert_eq!(base_label(r"C:\", "claude"), "c");
+        assert_eq!(base_label("", "claude"), "claude");
         assert_eq!(allocate("erebus", &[]), "erebus");
         assert_eq!(allocate("erebus", &["erebus"]), "erebus-2");
         assert_eq!(allocate("erebus", &["erebus", "erebus-2", "stratum"]), "erebus-3");
