@@ -1,0 +1,15 @@
+# Build output
+/app/target/
+
+# Design kits as received (zips and their extracted copies)
+*.zip
+/kit_v2/
+/kit_v3/
+
+# Generated screenshots (reproducible from the prototypes and the face's --screenshot mode)
+/concepts/shots/
+/v3/shots/
+/app/shots/
+
+# Dropped direction (EVE station assets)
+/concepts/station/

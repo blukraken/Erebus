@@ -1,0 +1,19 @@
+[package]
+name = "pinnos-core"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+pinnos-protocol.workspace = true
+pinnos-theme.workspace = true
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "net", "time", "io-util", "signal", "sync", "macros"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
