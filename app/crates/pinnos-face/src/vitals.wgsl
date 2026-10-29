@@ -31,11 +31,22 @@ fn clip(p: vec2f) -> vec4f {
     return vec4f(p.x / u.size.x * 2.0 - 1.0, 1.0 - p.y / u.size.y * 2.0, 0.0, 1.0);
 }
 
-// Load at braid x: history scrolls right to left, and the last stretch eases from the
-// newest sample into the load now at the instrument.
+// Load at braid x, blurred over ±2 s with 1-4-6-4-1 weights so a load step swells the
+// braid over a few seconds instead of standing up as a wall.
 fn load_at(r: u32, x: f32) -> f32 {
+    let age = SPAN * (1.0 - x / u.rows[r].rect.z);
+    let a = max(age, 2.0);
+    let edge = raw_at(r, age);
+    let blur = (raw_at(r, a - 2.0) + 4.0 * raw_at(r, a - 1.0) + 6.0 * raw_at(r, a) + 4.0 * raw_at(r, a + 1.0) + raw_at(r, a + 2.0)) / 16.0;
+    // The last 2 s near the instrument blend back to the exact reading, so the braid meets
+    // the instrument at the value it shows.
+    return mix(edge, blur, clamp(age / 2.0, 0.0, 1.0));
+}
+
+// Load at a given age: history scrolls right to left, and the last stretch eases from the
+// newest sample into the load now at the instrument.
+fn raw_at(r: u32, age: f32) -> f32 {
     let row = u.rows[r];
-    let age = SPAN * (1.0 - x / row.rect.z);
     let a0 = row.live.y;
     let base = r * 64u;
     if age <= a0 {
