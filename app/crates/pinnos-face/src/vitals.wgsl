@@ -187,8 +187,8 @@ struct SegOut {
     // Along and across the stroke, pixels.
     @location(0) local: vec2f,
     @location(1) @interpolate(flat) color: vec4f,
-    // Length, half-width.
-    @location(2) @interpolate(flat) dims: vec2f,
+    // Length, half-width, kind: 0 stroke, 1 round dot, 2 soft glow.
+    @location(2) @interpolate(flat) dims: vec3f,
 };
 
 @vertex
@@ -200,18 +200,31 @@ fn seg_vs(@builtin(vertex_index) i: u32, s: SegIn) -> SegOut {
     let n = vec2f(-dir.y, dir.x);
     let hw = s.width.x * 0.5;
     let corner = vec2f(f32(i & 1u), f32((i >> 1u) & 1u));
-    let along = mix(-1.0, len + 1.0, corner.x);
+    let cap = select(1.0, hw + 1.0, s.width.y > 0.5);
+    let along = mix(-cap, len + cap, corner.x);
     let across = mix(-hw - 1.0, hw + 1.0, corner.y);
     var out: SegOut;
     out.pos = clip(a + dir * along + n * across);
     out.local = vec2f(along, across);
     out.color = s.color;
-    out.dims = vec2f(len, hw);
+    out.dims = vec3f(len, hw, s.width.y);
     return out;
 }
 
 @fragment
 fn seg_fs(in: SegOut) -> @location(0) vec4f {
+    // Dots and glows are measured from the centre, so they come out round.
+    if in.dims.z > 0.5 {
+        let r = length(vec2f(in.local.x - in.dims.x * 0.5, in.local.y));
+        var k = clamp(in.dims.y - r + 0.5, 0.0, 1.0);
+        if in.dims.z > 1.5 {
+            // Gaussian, shifted so it reaches zero at the quad's edge.
+            let g = exp(-r * r / (2.0 * pow(in.dims.y * 0.4, 2.0)));
+            let edge = exp(-1.0 / (2.0 * 0.16));
+            k = max(g - edge, 0.0) / (1.0 - edge);
+        }
+        return vec4f(in.color.rgb * k, 0.0);
+    }
     let across = stroke(abs(in.local.y), in.dims.y);
     let along = clamp(min(in.local.x, in.dims.x - in.local.x) + 0.5, 0.0, 1.0);
     return vec4f(in.color.rgb * across * along, 0.0);

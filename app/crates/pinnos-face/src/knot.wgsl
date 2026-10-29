@@ -47,11 +47,6 @@ fn to_ndc(px: vec2f) -> vec4f {
     return vec4f(px.x / k.frame.x * 2.0 - 1.0, 1.0 - px.y / k.frame.y * 2.0, 0.0, 1.0);
 }
 
-// Angle into -PI..PI.
-fn wrap_pi(a: f32) -> f32 {
-    return a - TAU * floor((a + PI) / TAU);
-}
-
 // Depth cue: the far side is at most a quarter dimmer and a little smaller, with no step.
 fn depth_dim(depth: f32) -> f32 {
     return mix(0.75, 1.0, clamp(depth, 0.0, 1.0));
@@ -194,17 +189,7 @@ fn particle_vs(@builtin(vertex_index) vi: u32, d: PIn) -> POut {
                     b = (TRAIL_FLOOR + TRAIL_SPAN * u) * gap0 * gap1;
                     let fresh = min(behind0, behind1);
                     grow = 1.0 + 0.3 * (1.0 - smoothstep(0.0, 0.25, fresh));
-                    // Synapse: a soft swell where the heads met. It rises over ~0.5 s after
-                    // contact, spreads along the strand and fades over ~1.5 s. `gap` turns
-                    // positive at contact, so nothing lights before it.
-                    let gap = wrap_pi(h0 - h1);
-                    let meet = h0 - 0.5 * gap;
-                    let spread = 0.06 + 0.2 * gap;
-                    let near = wrap_pi(t - meet) / max(spread, 0.06);
-                    let env = smoothstep(0.0, 0.55, gap) * exp(-max(gap, 0.0) / 0.9);
-                    let swell = 0.3 * env * exp(-near * near) * gap0 * gap1;
-                    b += swell;
-                    hot = clamp(0.5 * swell + 0.6 * pow(1.0 - fresh, 12.0), 0.0, 1.0);
+                    hot = 0.6 * pow(1.0 - fresh, 12.0);
                 }
             } else {
                 if reduced {

@@ -249,6 +249,20 @@ fn dot(x: f32, y: f32, size: f32, c: Rgb, alpha: f32) -> Seg {
     seg([x - size * 0.5, y], [x + size * 0.5, y], c, alpha, size)
 }
 
+/// A round, anti-aliased dot of diameter `size`.
+fn bead(x: f32, y: f32, size: f32, c: Rgb, alpha: f32) -> Seg {
+    let mut s = seg([x, y], [x, y], c, alpha, size);
+    s.width[1] = 1.0;
+    s
+}
+
+/// A soft round glow; `size` spans about five standard deviations.
+fn glow(x: f32, y: f32, size: f32, c: Rgb, alpha: f32) -> Seg {
+    let mut s = seg([x, y], [x, y], c, alpha, size);
+    s.width[1] = 2.0;
+    s
+}
+
 fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
     let t = t.clamp(0.0, 1.0);
     let ch = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t).round() as u8;
@@ -635,7 +649,11 @@ impl Vitals {
 
         let u = if s.gpu { quant(s.util / 100.0, 400.0).clamp(0.0, 1.0) } else { 0.0 };
         let reach = rr * (0.16 + 0.62 * u.sqrt());
-        let dd = (1.5 * i.q).max(i.px);
+        let dd = (1.1 * i.q).max(1.5 * i.px);
+        if s.gpu {
+            out.push(glow(cx, cy, reach * 2.6, theme::EMBER, 0.12 + 0.3 * u));
+            out.push(glow(cx, cy, reach * 1.1, theme::HOT, 0.15 + 0.45 * u));
+        }
         let n = 110;
         let golden = PI * (3.0 - 5f32.sqrt());
         let stir = self.stir as f32;
@@ -651,10 +669,10 @@ impl Vitals {
             } else {
                 (theme::DIM, 0.4)
             };
-            out.push(dot(cx + t.cos() * r, cy + t.sin() * r, dd, c, a.min(1.0)));
+            out.push(bead(cx + t.cos() * r, cy + t.sin() * r, dd, c, a.min(1.0)));
         }
         if s.gpu {
-            out.push(dot(cx, cy, rr * (0.08 + 0.12 * u), theme::HOT_CORE, 0.35 + 0.6 * u));
+            out.push(glow(cx, cy, rr * (0.25 + 0.3 * u), theme::HOT_CORE, 0.3 + 0.6 * u));
         }
     }
 

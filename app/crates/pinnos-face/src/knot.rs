@@ -9,8 +9,8 @@
 //! travel in opposite directions, each a jittering cluster of dots. Every trail dot lights
 //! by how far it lies behind each head, so each head drags a trail one loop long that stays
 //! bright for a quarter loop, then fades slowly to a faint floor. The whole knot is always
-//! traced, and a short dark gap runs in front of each head. Where the heads pass, the strand
-//! flashes. Depth only dims and shrinks the far side a little, continuously, so nothing
+//! traced, and a short dark gap runs in front of each head. The heads pass each other without
+//! a flash. Depth only dims and shrinks the far side a little, continuously, so nothing
 //! flares as it turns toward the viewer.
 //!
 //! The knot is pearl, so the Claude entity's ember stays distinct; only the centre is hot.
