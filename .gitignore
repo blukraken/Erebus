@@ -1,9 +1,3 @@
-# Allowlist: only the app source is tracked. Everything else at the root (docs, design
-# history, prototypes, kits) stays on disk and out of git.
-/*
-!/.gitignore
-!/app/
-
 # Build output and generated evidence
 /app/target/
 /app/shots/
