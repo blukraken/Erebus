@@ -245,10 +245,6 @@ fn seg(a: [f32; 2], b: [f32; 2], c: Rgb, alpha: f32, width: f32) -> Seg {
     Seg { ab: [a[0], a[1], b[0], b[1]], color: [r * alpha, g * alpha, bl * alpha, alpha], width: [width, 0.0, 0.0, 0.0] }
 }
 
-fn dot(x: f32, y: f32, size: f32, c: Rgb, alpha: f32) -> Seg {
-    seg([x - size * 0.5, y], [x + size * 0.5, y], c, alpha, size)
-}
-
 /// A round, anti-aliased dot of diameter `size`.
 fn bead(x: f32, y: f32, size: f32, c: Rgb, alpha: f32) -> Seg {
     let mut s = seg([x, y], [x, y], c, alpha, size);
@@ -557,55 +553,82 @@ impl Vitals {
         Some(Frame { uniform, history, generation: self.generation, segs, text: TextFrame { rows, tip }, rules })
     }
 
-    /// Woven swatch: one crossing per GB, eight to a row. Lit crossings are in use, and a
-    /// partly used GB shows as a smaller square. The newest burns hot with a halo.
+    /// Settling reservoir: a rounded vessel filled with particles up to the share of RAM in
+    /// use. The surface shimmers, particles drift slowly, and brass ticks on the left mark
+    /// every 8 GB.
     fn ram_inst(&self, i: &Inst, out: &mut Vec<Seg>) {
-        let total = gb(self.ram_total_mb()).ceil().max(1.0) as usize;
-        let rows = total.div_ceil(8);
-        let cs = (i.w * 0.92 / 8.0).min(i.h * 0.9 / rows as f32);
-        let (sw, sh) = (cs * 8.0, cs * rows as f32);
-        let (x0, y0) = (i.x + (i.w - sw) * 0.5, i.y + (i.h - sh) * 0.5);
-        let lw = (0.8 * i.q).max(i.px);
-        let wobble = cs * 0.09;
-        let thread = |out: &mut Vec<Seg>, pts: &mut dyn Iterator<Item = [f32; 2]>| {
-            let mut prev = None;
-            for p in pts {
-                if let Some(a) = prev {
-                    out.push(seg(a, p, theme::BONE_2, 0.34, lw));
+        let (w, h) = ((i.w * 0.9).min(i.h * 1.5), i.h * 0.84);
+        let (x0, y0) = (i.x + (i.w - w) * 0.5, i.y + (i.h - h) * 0.5);
+        let rad = h * 0.18;
+        let lw = (0.9 * i.q).max(i.px);
+        let phase = self.phase as f32;
+
+        // Vessel outline, corners as quarter arcs.
+        let corners = [(x0 + w - rad, y0 + rad, -0.5), (x0 + w - rad, y0 + h - rad, 0.0), (x0 + rad, y0 + h - rad, 0.5), (x0 + rad, y0 + rad, 1.0)];
+        let mut pts = Vec::with_capacity(4 * 7 + 1);
+        for (cx, cy, a0) in corners {
+            for j in 0..=6 {
+                let t = (a0 + j as f32 / 12.0) * PI;
+                pts.push([cx + t.cos() * rad, cy + t.sin() * rad]);
+            }
+        }
+        pts.push(pts[0]);
+        for p in pts.windows(2) {
+            out.push(seg(p[0], p[1], theme::RULE_2, 0.9, lw));
+        }
+
+        let total = gb(self.ram_total_mb());
+        let mut g = 8.0;
+        while g < total {
+            let y = y0 + h * (1.0 - g / total);
+            out.push(seg([x0 - 5.0 * i.q, y], [x0 - 1.5 * i.q, y], theme::BRASS, 0.7, lw));
+            g += 8.0;
+        }
+
+        // Inside test for the rounded rectangle, inset so particles clear the wall.
+        let pad = 2.0 * i.q;
+        let inside = |x: f32, y: f32| {
+            let qx = ((x - (x0 + w * 0.5)).abs() - (w * 0.5 - rad)).max(0.0);
+            let qy = ((y - (y0 + h * 0.5)).abs() - (h * 0.5 - rad)).max(0.0);
+            (qx * qx + qy * qy).sqrt() < rad - pad
+        };
+
+        let fill = (self.shown.ram_mb / self.ram_total_mb()).clamp(0.0, 1.0);
+        let level = y0 + h * (1.0 - fill);
+        let dd = (1.1 * i.q).max(1.5 * i.px);
+        let n = 420;
+        for k in 0..n {
+            let (fx, fy) = (hash01(k * 2), hash01(k * 2 + 1));
+            let m = if k % 2 == 0 { 0.2 } else { 0.6 };
+            let x = x0 + pad + fx * (w - 2.0 * pad) + 1.2 * dd * (phase * m + k as f32).sin();
+            let y = y0 + pad + fy * (h - 2.0 * pad) + 0.8 * dd * (phase * m + k as f32 * 1.3).cos();
+            if y < level + dd || !inside(x, y) {
+                continue;
+            }
+            let near = 1.0 - ((y - level) / (h * 0.3)).clamp(0.0, 1.0);
+            let c = mix(theme::BONE_2, theme::EMBER, near * 0.8);
+            out.push(bead(x, y, dd, c, 0.45 + 0.4 * near));
+        }
+
+        if fill > 0.0 {
+            let span = |x: f32| {
+                let qx = ((x - (x0 + w * 0.5)).abs() - (w * 0.5 - rad)).max(0.0);
+                let dy = (level - (y0 + h * 0.5)).abs() - (h * 0.5 - rad);
+                dy <= 0.0 || qx * qx + dy * dy < rad * rad
+            };
+            let steps = 40;
+            let mut prev: Option<[f32; 2]> = None;
+            for j in 0..=steps {
+                let x = x0 + w * j as f32 / steps as f32;
+                let y = level + 0.9 * i.q * (x / (w * 0.12) + phase).sin();
+                let p = [x, y];
+                match prev {
+                    Some(a) if span(x) && span(a[0]) => out.push(seg(a, p, theme::HOT, 0.85, lw * 1.3)),
+                    _ => {}
                 }
                 prev = Some(p);
             }
-        };
-        for c in 0..8 {
-            let x = x0 + cs * (c as f32 + 0.5);
-            let n = 2 * rows;
-            thread(out, &mut (0..=n).map(|j| {
-                let o = (j as f32 * PI * 0.5 + c as f32 * PI).sin() * wobble;
-                [x + o, y0 + sh * j as f32 / n as f32]
-            }));
-        }
-        for r in 0..rows {
-            let y = y0 + cs * (r as f32 + 0.5);
-            thread(out, &mut (0..=16).map(|j| {
-                let o = (j as f32 * PI * 0.5 + r as f32 * PI + PI * 0.5).sin() * wobble;
-                [x0 + sw * j as f32 / 16.0, y + o]
-            }));
-        }
-        let used = gb(self.shown.ram_mb);
-        let top = used.ceil() as usize;
-        for k in 0..total {
-            let (r, c) = (k / 8, k % 8);
-            let (bx, by) = (x0 + cs * (c as f32 + 0.5), y0 + sh - cs * (r as f32 + 0.5));
-            let fill = (used - k as f32).clamp(0.0, 1.0);
-            let size = cs * (0.18 + 0.14 * quant(fill, 32.0));
-            if fill <= 0.0 {
-                out.push(dot(bx, by, cs * 0.18, theme::DIM, 0.5));
-            } else if k + 1 == top {
-                out.push(dot(bx, by, cs * 0.62, theme::EMBER, 0.22));
-                out.push(dot(bx, by, size * 1.15, theme::HOT_CORE, 1.0));
-            } else {
-                out.push(dot(bx, by, size, theme::BONE_2, 0.8));
-            }
+            out.push(glow(x0 + w * 0.5, level, w * 0.9, theme::EMBER, 0.08));
         }
     }
 
@@ -715,6 +738,15 @@ struct Inst {
 
 /// Rounds to `1 / steps`, so eased values change the instruments a few times a second,
 /// not every frame.
+/// A fixed pseudo-random value in 0..1 for index `k`.
+fn hash01(k: usize) -> f32 {
+    let mut x = (k as u32).wrapping_mul(0x9E37_79B9) ^ 0x85EB_CA6B;
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x7FEB_352D);
+    x ^= x >> 15;
+    (x & 0xFF_FFFF) as f32 / 16_777_216.0
+}
+
 fn quant(v: f32, steps: f32) -> f32 {
     (v * steps).round() / steps
 }
@@ -1028,13 +1060,18 @@ mod tests {
         let col = column(5120, 1440, 1.0).unwrap();
         let f = v.frame(Some(&col), CANNED_T0 + 400, (5120, 1440), false).unwrap();
         assert!(f.segs.len() < MAX_SEGS);
-        // RAM: 31 crossings in an 8 × 4 swatch, one per GB, plus the newest one's halo.
+        // RAM: the reservoir holds more particles as more RAM is in use.
         let mut r = Vitals::default();
         let mut out = Vec::new();
         r.ingest(Msg { hw: canned_hw(), samples: vec![canned_sample(0)] });
-        r.ram_inst(&Inst { x: 0.0, y: 0.0, w: 190.0, h: 130.0, q: 2.0, px: 1.0 }, &mut out);
-        let threads = 8 * 8 + 4 * 16;
-        assert_eq!(out.len() - threads, 31 + 1);
+        let ram = Inst { x: 0.0, y: 0.0, w: 190.0, h: 130.0, q: 2.0, px: 1.0 };
+        r.shown.ram_mb = 4_000.0;
+        r.ram_inst(&ram, &mut out);
+        let low = out.len();
+        out.clear();
+        r.shown.ram_mb = 28_000.0;
+        r.ram_inst(&ram, &mut out);
+        assert!(out.len() > low + 50, "{low} -> {}", out.len());
         // CPU: 32 columns of 10.
         out.clear();
         r.cpu_inst(&Inst { x: 0.0, y: 0.0, w: 190.0, h: 145.0, q: 2.0, px: 1.0 }, &mut out);
