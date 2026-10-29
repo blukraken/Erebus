@@ -17,6 +17,8 @@ pub const ROWS: usize = 3;
 pub const SLOTS: usize = 64;
 /// Instrument segments the buffer holds.
 pub const MAX_SEGS: usize = 2048;
+/// Panel strokes the panel buffer holds: 90 s sparklines for every measure and core.
+pub const PANEL_SEGS: usize = 8192;
 
 /// Easing time constants, seconds, as in the prototype.
 const EASE_CORES: f32 = 0.22;
@@ -33,8 +35,8 @@ const PHASE_WRAP: f64 = 10.0 * std::f64::consts::PI;
 /// A core burns ember this far above its 60 s mean, in percent.
 const CORE_HOT: f32 = 14.0;
 
-/// Bone-3 as the prototype lifts it inside the vitals column.
-const LABEL: Rgb = Rgb::hex(0xb9ae98);
+/// Bone-3 as the prototype lifts it inside the vitals column and on surfaces.
+pub const LABEL: Rgb = Rgb::hex(0xb9ae98);
 /// Tooltip ground, the prototype's `#vtTip` background.
 pub const TIP_GROUND: Rgb = Rgb::hex(0x0e0c0b);
 
@@ -97,6 +99,10 @@ pub struct Column {
     pub k: f32,
     /// The column's right edge; the tooltip opens past it.
     pub right: f32,
+    /// Physical pixels per prototype `U`.
+    pub u: f32,
+    /// Band top and bottom: the space between the top rail and the bottom bar.
+    pub band: [f32; 2],
     pub rows: [RowBox; ROWS],
 }
 
@@ -148,7 +154,7 @@ pub fn column(w: u32, h: u32, scale: f64) -> Option<Column> {
         y += row_h[i] + gap;
         b
     });
-    Some(Column { px: s, k: kf * s, right: feed_w * s, rows })
+    Some(Column { px: s, k: kf * s, right: feed_w * s, u: u * s, band: [y0 * s, y1 * s], rows })
 }
 
 /// Readings as drawn: eased toward the newest sample.
@@ -240,20 +246,20 @@ pub struct Seg {
     pub width: [f32; 4],
 }
 
-fn seg(a: [f32; 2], b: [f32; 2], c: Rgb, alpha: f32, width: f32) -> Seg {
+pub fn seg(a: [f32; 2], b: [f32; 2], c: Rgb, alpha: f32, width: f32) -> Seg {
     let [r, g, bl] = c.srgb_f32();
     Seg { ab: [a[0], a[1], b[0], b[1]], color: [r * alpha, g * alpha, bl * alpha, alpha], width: [width, 0.0, 0.0, 0.0] }
 }
 
 /// A round, anti-aliased dot of diameter `size`.
-fn bead(x: f32, y: f32, size: f32, c: Rgb, alpha: f32) -> Seg {
+pub fn bead(x: f32, y: f32, size: f32, c: Rgb, alpha: f32) -> Seg {
     let mut s = seg([x, y], [x, y], c, alpha, size);
     s.width[1] = 1.0;
     s
 }
 
 /// A soft round glow; `size` spans about five standard deviations.
-fn glow(x: f32, y: f32, size: f32, c: Rgb, alpha: f32) -> Seg {
+pub fn glow(x: f32, y: f32, size: f32, c: Rgb, alpha: f32) -> Seg {
     let mut s = seg([x, y], [x, y], c, alpha, size);
     s.width[1] = 2.0;
     s
@@ -310,7 +316,7 @@ fn gb(mb: f32) -> f32 {
 }
 
 /// GPU name without the vendor and brand: "RTX 5080".
-fn short_gpu(name: &str) -> &str {
+pub fn short_gpu(name: &str) -> &str {
     let n = name.strip_prefix("NVIDIA ").unwrap_or(name);
     n.strip_prefix("GeForce ").unwrap_or(n)
 }
@@ -322,6 +328,20 @@ impl Vitals {
 
     pub fn newest_ms(&self) -> Option<u64> {
         self.hist.back().map(|s| s.unix_ms)
+    }
+
+    pub fn hardware(&self) -> Option<&Hardware> {
+        self.hw.as_ref()
+    }
+
+    /// The last 90 samples, oldest first.
+    pub fn samples(&self) -> &VecDeque<Sample> {
+        &self.hist
+    }
+
+    /// Changes whenever the samples do.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Forgets everything; the core replays its history on reconnect.
@@ -767,16 +787,21 @@ pub fn shader() -> String {
 
 /// Braid and instrument pipelines and their buffers. Each frame writes the uniform; the
 /// history and segments are written only when they change.
+///
+/// Panel strokes share the instrument pipeline from a buffer of their own, drawn later,
+/// over the panel ground.
 pub struct Painter {
     braid: wgpu::RenderPipeline,
     segs: wgpu::RenderPipeline,
     uniform: wgpu::Buffer,
     history: wgpu::Buffer,
     seg_buf: wgpu::Buffer,
+    panel_buf: wgpu::Buffer,
     bind: wgpu::BindGroup,
     last_uniform: Option<Uniform>,
     last_generation: Option<u64>,
     last_segs: Vec<Seg>,
+    last_panel: Option<u64>,
 }
 
 impl Painter {
@@ -792,6 +817,7 @@ impl Painter {
         let uniform = buffer("vitals", size_of::<Uniform>(), wgpu::BufferUsages::UNIFORM | copy);
         let history = buffer("vitals history", 4 * ROWS * SLOTS, wgpu::BufferUsages::STORAGE | copy);
         let seg_buf = buffer("vitals segments", size_of::<Seg>() * MAX_SEGS, wgpu::BufferUsages::VERTEX | copy);
+        let panel_buf = buffer("panel segments", size_of::<Seg>() * PANEL_SEGS, wgpu::BufferUsages::VERTEX | copy);
 
         let entry = |binding, ty| wgpu::BindGroupLayoutEntry {
             binding,
@@ -860,10 +886,33 @@ impl Painter {
             uniform,
             history,
             seg_buf,
+            panel_buf,
             bind,
             last_uniform: None,
             last_generation: None,
             last_segs: Vec::new(),
+            last_panel: None,
+        }
+    }
+
+    /// Writes panel strokes when `key` changes.
+    pub fn prepare_panel(&mut self, queue: &wgpu::Queue, key: u64, segs: &[Seg]) {
+        if self.last_panel != Some(key) {
+            let n = segs.len().min(PANEL_SEGS);
+            if n > 0 {
+                queue.write_buffer(&self.panel_buf, 0, bytemuck::cast_slice(&segs[..n]));
+            }
+            self.last_panel = Some(key);
+        }
+    }
+
+    pub fn draw_panel(&self, pass: &mut wgpu::RenderPass, count: usize) {
+        let n = count.min(PANEL_SEGS) as u32;
+        if n > 0 {
+            pass.set_bind_group(0, &self.bind, &[]);
+            pass.set_pipeline(&self.segs);
+            pass.set_vertex_buffer(0, self.panel_buf.slice(..));
+            pass.draw(0..4, 0..n);
         }
     }
 

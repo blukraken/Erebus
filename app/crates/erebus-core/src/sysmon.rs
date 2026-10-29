@@ -4,6 +4,14 @@
 //! CPU comes from `NtQuerySystemInformation` counter deltas, RAM from `GlobalMemoryStatusEx`,
 //! and the GPU from `nvml.dll`, loaded at run time. A machine without NVML reports `gpu: None`.
 //! `EREBUS_NVML=0` skips NVML entirely.
+//!
+//! Debug builds read `EREBUS_FAULT` once at start, a comma-separated list of fault tokens.
+//! Release builds ignore it.
+//!
+//! - `nvml-dll` acts as if `nvml.dll` is not found.
+//! - `nvml-init` acts as if `nvmlInit_v2` failed.
+//! - `gpu@N`, `ram@N` and `cpu@N` fail that read on loop iterations N, N+1 and N+2
+//!   (1-based), then recover.
 
 use std::ffi::{c_char, c_void, CStr};
 use std::mem::size_of;
@@ -143,10 +151,87 @@ struct Nvml {
     info: GpuInfo,
 }
 
+/// Injected failures. All fields stay at their defaults in release builds.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Faults {
+    nvml_dll: bool,
+    nvml_init: bool,
+    gpu_at: Option<u32>,
+    ram_at: Option<u32>,
+    cpu_at: Option<u32>,
+}
+
+/// Reads fail for this many consecutive iterations starting at `@N`.
+const FAULT_SPAN: u32 = 3;
+
+impl Faults {
+    #[cfg(debug_assertions)]
+    fn from_env() -> Faults {
+        Faults::parse(&std::env::var("EREBUS_FAULT").unwrap_or_default())
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn from_env() -> Faults {
+        Faults::default()
+    }
+
+    #[cfg(any(debug_assertions, test))]
+    fn parse(spec: &str) -> Faults {
+        let mut f = Faults::default();
+        for tok in spec.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+            let at = |name: &str| tok.strip_prefix(name)?.strip_prefix('@')?.parse::<u32>().ok();
+            match tok {
+                "nvml-dll" => f.nvml_dll = true,
+                "nvml-init" => f.nvml_init = true,
+                _ if at("gpu").is_some() => f.gpu_at = at("gpu"),
+                _ if at("ram").is_some() => f.ram_at = at("ram"),
+                _ if at("cpu").is_some() => f.cpu_at = at("cpu"),
+                _ => log_warn!("unknown EREBUS_FAULT token {tok:?}"),
+            }
+        }
+        f
+    }
+
+    /// True when `at` covers loop iteration `n`.
+    fn hits(at: Option<u32>, n: u32) -> bool {
+        at.is_some_and(|a| (a..a + FAULT_SPAN).contains(&n))
+    }
+}
+
+/// Warns on the first failure of a read, and reports its recovery once.
+struct ReadWatch {
+    what: &'static str,
+    warned: bool,
+}
+
+impl ReadWatch {
+    fn new(what: &'static str) -> ReadWatch {
+        ReadWatch { what, warned: false }
+    }
+
+    fn failed(&mut self, effect: &str) {
+        if !std::mem::replace(&mut self.warned, true) {
+            log_warn!("{} read failed; {effect}", self.what);
+        }
+    }
+
+    fn ok(&mut self) {
+        if std::mem::replace(&mut self.warned, false) {
+            log_info!("{} read recovered", self.what);
+        }
+    }
+}
+
 impl Nvml {
-    fn load() -> Result<Nvml, String> {
+    fn load(faults: &Faults) -> Result<Nvml, String> {
         if std::env::var("EREBUS_NVML").is_ok_and(|v| v.trim() == "0") {
             return Err("disabled by EREBUS_NVML=0".into());
+        }
+        if faults.nvml_dll {
+            return Err("nvml.dll not found (injected)".into());
+        }
+        if faults.nvml_init {
+            return Err("nvmlInit_v2 failed (injected)".into());
         }
         let name: Vec<u16> = "nvml.dll\0".encode_utf16().collect();
         // SAFETY: `name` is a NUL-terminated UTF-16 string.
@@ -254,7 +339,8 @@ fn run(hub: UnboundedSender<Event>) {
         log_warn!("vitals unavailable: initial CPU or RAM read failed");
         return;
     };
-    let nvml = match Nvml::load() {
+    let faults = Faults::from_env();
+    let nvml = match Nvml::load(&faults) {
         Ok(n) => Some(n),
         Err(why) => {
             log_info!("no GPU vitals: {why}");
@@ -266,26 +352,31 @@ fn run(hub: UnboundedSender<Event>) {
         return;
     }
 
-    let mut ram_warned = false;
-    let mut gpu_warned = false;
+    let (mut cpu_watch, mut ram_watch, mut gpu_watch) =
+        (ReadWatch::new("CPU"), ReadWatch::new("RAM"), ReadWatch::new("GPU"));
+    let mut n = 0u32;
     loop {
         thread::sleep(until_next_second(unix_ms()));
-        let Some(cur) = read_counters() else { continue };
+        n += 1;
+        let cur = read_counters().filter(|_| !Faults::hits(faults.cpu_at, n));
+        let Some(cur) = cur else {
+            cpu_watch.failed("samples are skipped");
+            continue;
+        };
+        cpu_watch.ok();
         let (cpu, cores) = cpu_percent(&prev, &cur);
         prev = cur;
-        let ram_used_mb = match read_ram() {
-            Some((_, used)) => used,
-            None => {
-                if !std::mem::replace(&mut ram_warned, true) {
-                    log_warn!("RAM read failed");
-                }
-                continue;
-            }
+        let ram = read_ram().filter(|_| !Faults::hits(faults.ram_at, n));
+        let Some((_, ram_used_mb)) = ram else {
+            ram_watch.failed("samples are skipped");
+            continue;
         };
-        let gpu = nvml.as_ref().and_then(|n| {
-            let g = n.read();
-            if g.is_none() && !std::mem::replace(&mut gpu_warned, true) {
-                log_warn!("GPU read failed; affected samples carry no GPU");
+        ram_watch.ok();
+        let gpu = nvml.as_ref().and_then(|nv| {
+            let g = nv.read().filter(|_| !Faults::hits(faults.gpu_at, n));
+            match g {
+                Some(_) => gpu_watch.ok(),
+                None => gpu_watch.failed("affected samples carry no GPU"),
             }
             g
         });
@@ -354,6 +445,35 @@ mod tests {
         assert_eq!(until_next_second(5_000), Duration::from_millis(1000));
         assert_eq!(until_next_second(5_250), Duration::from_millis(750));
         assert_eq!(until_next_second(5_999), Duration::from_millis(1));
+    }
+
+    #[test]
+    fn fault_tokens_parse() {
+        let f = Faults::parse("nvml-dll, gpu@2,ram@5,cpu@9,bogus,gpu@x");
+        assert_eq!(
+            f,
+            Faults { nvml_dll: true, nvml_init: false, gpu_at: Some(2), ram_at: Some(5), cpu_at: Some(9) }
+        );
+        assert_eq!(Faults::parse(""), Faults::default());
+        assert!(Faults::parse("nvml-init").nvml_init);
+    }
+
+    #[test]
+    fn fault_window_covers_three_iterations() {
+        let at = Some(2);
+        let hit: Vec<u32> = (1..=6).filter(|n| Faults::hits(at, *n)).collect();
+        assert_eq!(hit, vec![2, 3, 4]);
+        assert!(!Faults::hits(None, 2));
+    }
+
+    #[test]
+    fn read_watch_warns_once_and_rearms() {
+        let mut w = ReadWatch::new("X");
+        w.failed("e");
+        assert!(w.warned);
+        w.failed("e");
+        w.ok();
+        assert!(!w.warned);
     }
 
     #[test]

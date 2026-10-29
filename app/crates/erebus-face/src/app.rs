@@ -41,6 +41,7 @@
 use crate::gpu::Gpu;
 use crate::knot;
 use crate::link::{self, Link, LinkEvent};
+use crate::panel::{self, Panel};
 use crate::render::{self, Close, Renderer, Scene, View};
 use crate::vitals::{self, Vitals};
 use erebus_protocol::{Context, FaceMsg, GitState};
@@ -120,8 +121,11 @@ enum Hit {
     /// The top rail: moves the window in windowed mode; a double-click toggles fullscreen.
     Rail,
     Edge(ResizeDirection),
-    /// A vitals row: shows its tooltip.
+    /// A vitals row: shows its tooltip, and a click opens the panel on it.
     Vital(vitals::Row),
+    /// The open vitals panel, and its "— collapse" control.
+    Panel,
+    Collapse,
 }
 
 struct Live {
@@ -207,6 +211,8 @@ struct App {
     last_sim: Instant,
     state: StateLog,
     vitals: Vitals,
+    panel: Panel,
+    collapse_hover: bool,
 }
 
 pub fn run(opts: Options) -> Result<(), String> {
@@ -265,6 +271,8 @@ pub fn run(opts: Options) -> Result<(), String> {
         last_sim: now,
         state: StateLog { state: RenderState::Calm, since: now, frames: 0 },
         vitals: Vitals::default(),
+        panel: Panel::default(),
+        collapse_hover: false,
     };
     app.reduced = app.opts.reduced_motion || animations_off();
     log::info!("reduced motion {}", if app.reduced { "on" } else { "off" });
@@ -561,6 +569,7 @@ impl App {
             // Missed events do not replay: the knot resumes at the current state.
             self.sim.snap();
             self.vitals.snap();
+            self.panel.snap();
             self.last_sim = now;
             self.redraw("resumed");
         }
@@ -590,7 +599,7 @@ impl App {
 
     /// Animation frames are due: the knot moves, or a transition runs.
     fn animating(&self) -> bool {
-        self.state.state != RenderState::Suspended && (!self.reduced || self.sim.busy())
+        self.state.state != RenderState::Suspended && (!self.reduced || self.sim.busy() || self.panel.busy())
     }
 
     /// Hover hit on the knot: inside 0.9 of its radius, as in the prototype.
@@ -735,8 +744,33 @@ impl App {
         } else if y < c.rail {
             return Hit::Rail;
         }
-        let vital = self.vitals.has_data().then(|| vitals::column(cw, ch, scale)?.hit(x, y)).flatten();
-        vital.map_or(Hit::None, Hit::Vital)
+        let Some(col) = vitals::column(cw, ch, scale).filter(|_| self.vitals.has_data()) else { return Hit::None };
+        if let Some(hw) = self.vitals.hardware().filter(|_| self.panel.is_open()) {
+            let l = panel::layout(&col, hw.cores as usize, (cw, ch));
+            if l.over_collapse(x, y) {
+                return Hit::Collapse;
+            } else if l.contains(x, y) {
+                return Hit::Panel;
+            }
+        }
+        col.hit(x, y).map_or(Hit::None, Hit::Vital)
+    }
+
+    /// Opens, moves or closes the vitals panel. A window that is not animating starts at once.
+    fn panel_change(&mut self, change: impl FnOnce(&mut Panel)) {
+        let before = (self.panel.is_open(), self.panel.focus());
+        change(&mut self.panel);
+        if (self.panel.is_open(), self.panel.focus()) == before {
+            return;
+        }
+        match self.panel.focus() {
+            Some(row) => log::info!("vitals panel on {row:?}"),
+            None => log::info!("vitals panel closed"),
+        }
+        if self.panel.is_open() {
+            self.set_vital_hover(None);
+        }
+        self.redraw("vitals panel");
     }
 
     /// Shows the hovered row's tooltip. A window that is not animating draws it at once.
@@ -797,14 +831,23 @@ impl App {
         }
         self.cursor = Some(p);
         let hit = self.hit(p);
-        self.set_vital_hover(if let Hit::Vital(r) = hit { Some(r) } else { None });
+        let tip = if let Hit::Vital(r) = hit { (!self.panel.is_open()).then_some(r) } else { None };
+        self.set_vital_hover(tip);
+        if (hit == Hit::Collapse) != self.collapse_hover {
+            self.collapse_hover = hit == Hit::Collapse;
+            self.redraw("collapse hover");
+        }
         let over = hit == Hit::Close;
         self.set_close(match (self.close_armed, over) {
             (true, true) => Close::Press,
             (false, true) => Close::Hover,
             _ => Close::Rest,
         });
-        let icon = if let Hit::Edge(d) = hit { resize_cursor(d) } else { CursorIcon::Default };
+        let icon = match hit {
+            Hit::Edge(d) => resize_cursor(d),
+            Hit::Vital(_) | Hit::Collapse => CursorIcon::Pointer,
+            _ => CursorIcon::Default,
+        };
         if icon != self.cursor_icon {
             self.cursor_icon = icon;
             self.count(|a| a.cursor_sets += 1);
@@ -829,6 +872,9 @@ impl App {
                 }
             }
             return;
+        }
+        if self.panel.is_open() && !matches!(hit, Hit::Panel | Hit::Collapse | Hit::Vital(_)) {
+            self.panel_change(Panel::close);
         }
         let Some(live) = &self.live else { return };
         let w = live.window.clone();
@@ -864,7 +910,9 @@ impl App {
                     }
                 }
             }
-            Hit::Vital(_) | Hit::None => {}
+            Hit::Vital(row) => self.panel_change(|p| p.toggle(row)),
+            Hit::Collapse => self.panel_change(Panel::close),
+            Hit::Panel | Hit::None => {}
         }
     }
 
@@ -878,6 +926,7 @@ impl App {
         self.last_sim = now;
         self.sim.step(dt, self.reduced);
         self.vitals.step(dt, self.reduced);
+        self.panel.step(dt, self.reduced);
         let view = View { palette: self.palette, link: smoothstep(self.link_t), close: self.close };
         let more = if self.knot_live() { self.sim.files.more() } else { None };
         let Some(live) = &mut self.live else { return };
@@ -922,6 +971,7 @@ impl App {
         let crumbs: Vec<&str> = self.crumbs.iter().map(String::as_str).collect();
         let column = vitals::column(w, h, scale);
         let vitals = self.vitals.frame(column.as_ref(), unix_ms(), (w, h), self.reduced);
+        let panel = column.as_ref().and_then(|c| panel::frame(&self.panel, &self.vitals, c, (w, h), self.collapse_hover, self.reduced));
         let scene = Scene {
             view,
             knot: self.sim.uniform(w, h, scale, self.reduced),
@@ -934,6 +984,7 @@ impl App {
             file_label_alpha: self.sim.file_hover(),
             more: more.as_deref(),
             vitals: vitals.as_ref(),
+            panel: panel.as_ref(),
         };
         renderer.draw(gpu, &mut encoder, &target, (w, h), scale, &scene);
         gpu.queue.submit([encoder.finish()]);
@@ -1094,6 +1145,7 @@ impl ApplicationHandler<UiEvent> for App {
                 }
                 if !up {
                     self.vitals.clear();
+                    self.panel = Panel::default();
                 }
                 if up != self.link_up {
                     self.link_up = up;
@@ -1173,6 +1225,7 @@ impl ApplicationHandler<UiEvent> for App {
                     KeyCode::KeyQ if ctrl => self.close(event_loop, "Ctrl+Q"),
                     KeyCode::F4 if alt => self.close(event_loop, "Alt+F4"),
                     KeyCode::F11 => self.toggle_fullscreen(),
+                    KeyCode::Escape => self.panel_change(Panel::close),
                     KeyCode::KeyP if !ctrl && !alt => {
                         self.palette = !self.palette;
                         log::info!("palette {}", if self.palette { "on" } else { "off" });

@@ -1,4 +1,4 @@
-//! One render pass: ground, knot, shapes, then text. The window and screenshot mode both
+//! One render pass: ground, knot, vitals, shapes, panel strokes, then text. The window and screenshot mode both
 //! draw through [`Renderer::draw`], so their pixels match.
 //!
 //! Sizes follow the prototype's `resize()` in `v3/concept-loom4.html`: at 5120×1440 one
@@ -16,6 +16,7 @@ use glyphon::{
 use crate::files::{self, FileInst};
 use crate::gpu::Gpu;
 use crate::knot;
+use crate::panel;
 use crate::vitals;
 use erebus_theme::{self as theme, Rgb};
 use wgpu::util::DeviceExt;
@@ -62,6 +63,8 @@ pub struct Scene<'a> {
     pub more: Option<&'a str>,
     /// The vitals stack, when there are readings.
     pub vitals: Option<&'a vitals::Frame>,
+    /// The vitals panel, while any of it shows.
+    pub panel: Option<&'a panel::Frame>,
 }
 
 /// Window chrome in physical pixels, shared by drawing and hit testing.
@@ -294,6 +297,17 @@ struct TextKey {
     more: Option<String>,
 }
 
+#[derive(PartialEq)]
+struct Prepared {
+    palette: bool,
+    fades: [u8; 3],
+    /// Panel front, whole pixels.
+    clip: i32,
+    key: TextKey,
+    vitals: Option<vitals::TextFrame>,
+    panel: Option<panel::Text>,
+}
+
 struct Text {
     fonts: FontSystem,
     swash: SwashCache,
@@ -302,12 +316,15 @@ struct Text {
     renderer: TextRenderer,
     mono: &'static str,
     key: Option<TextKey>,
-    /// Palette, label fades (in 1/255 steps) and layouts of the last prepare.
-    prepared: Option<(bool, u8, u8, TextKey, Option<vitals::TextFrame>)>,
+    /// Palette, label and panel fades (in 1/255 steps) and layouts of the last prepare.
+    prepared: Option<Prepared>,
     /// Vitals rows and tooltip, and the text and type scale they were laid out for.
     vitals_key: Option<(vitals::TextFrame, u32)>,
     vitals_rows: Vec<Placed>,
     vitals_tip: Option<(Placed, [f32; 4])>,
+    /// Panel words and what they were laid out from.
+    panel_key: Option<panel::Text>,
+    panel: Vec<Placed>,
     /// Palette strip height, sized to its text.
     strip_h: f32,
     wordmark: Option<Placed>,
@@ -387,6 +404,8 @@ impl Text {
             vitals_key: None,
             vitals_rows: Vec::new(),
             vitals_tip: None,
+            panel_key: None,
+            panel: Vec::new(),
             strip_h: 0.0,
             wordmark: None,
             label: None,
@@ -556,14 +575,64 @@ impl Text {
         self.vitals_key = Some((text.clone(), k.to_bits()));
     }
 
+    /// Lays out the panel's words when they change. Prototype `.vp-body`: mono 11.5px; the
+    /// panel id is UI 600 12px.
+    fn layout_panel(&mut self, text: Option<&panel::Text>) {
+        let Some(text) = text else {
+            self.panel_key = None;
+            self.panel.clear();
+            return;
+        };
+        if self.panel_key.as_ref() == Some(text) {
+            return;
+        }
+        let fonts = &mut self.fonts;
+        self.panel = text
+            .items
+            .iter()
+            .map(|it| {
+                let family = if it.mono { self.mono } else { UI };
+                let weight = match (it.bold, it.mono) {
+                    (true, false) => Weight::SEMIBOLD,
+                    (true, true) => Weight::MEDIUM,
+                    _ => Weight::NORMAL,
+                };
+                let buf = line(fonts, &it.text, it.size * text.k, family, weight, 0.0, None);
+                let w = buf.layout_runs().map(|r| r.line_w).fold(0.0, f32::max);
+                let left = if it.right { it.x - w } else { it.x }.round();
+                let top = it.y.round();
+                let b = bounds(left, top, left + w + 1.0, top + height(&buf));
+                Placed { buf, left, top, color: it.color, bounds: b }
+            })
+            .collect();
+        self.panel_key = Some(text.clone());
+    }
+
     /// Prepares text when anything shown changed. Returns whether it did. `fades` are the
-    /// knot label's and the file label's.
-    fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, w: u32, h: u32, palette: bool, fades: [f32; 2]) -> bool {
+    /// knot label's, the file label's and the panel's; panel text right of `clip` is cut.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        w: u32,
+        h: u32,
+        palette: bool,
+        fades: [f32; 3],
+        clip: f32,
+    ) -> bool {
+        let clip = clip.min(w as f32).round() as i32;
         let byte = |a: f32| (a.clamp(0.0, 1.0) * 255.0).round() as u8;
-        let (fade, file_fade) = (byte(fades[0]), byte(fades[1]));
+        let (fade, file_fade, panel_fade) = (byte(fades[0]), byte(fades[1]), byte(fades[2]));
         let Some(key) = self.key.clone() else { return false };
-        let vitals = self.vitals_key.as_ref().map(|(t, _)| t.clone());
-        let state = (palette, fade, file_fade, key, vitals);
+        let state = Prepared {
+            palette,
+            fades: [fade, file_fade, panel_fade],
+            clip,
+            key,
+            vitals: self.vitals_key.as_ref().map(|(t, _)| t.clone()),
+            panel: self.panel_key.clone(),
+        };
         if self.prepared.as_ref() == Some(&state) {
             return false;
         }
@@ -579,6 +648,13 @@ impl Text {
         areas.extend(self.more.iter().map(Placed::area));
         areas.extend(self.vitals_rows.iter().map(Placed::area));
         areas.extend(self.vitals_tip.iter().map(|(p, _)| p.area()));
+        if panel_fade > 0 {
+            areas.extend(self.panel.iter().map(|p| {
+                let mut a = p.area_alpha(fades[2]);
+                a.bounds.right = a.bounds.right.min(clip);
+                a
+            }));
+        }
         if palette {
             areas.extend(self.cells.iter().map(Placed::area));
         }
@@ -866,7 +942,8 @@ impl Renderer {
         };
         self.text.layout(&l, key, scene.knot.radius());
         self.text.layout_vitals(l.k, scene.vitals.map(|v| &v.text));
-        let mut extra = Vec::with_capacity(5);
+        self.text.layout_panel(scene.panel.map(|p| &p.text));
+        let mut extra = Vec::with_capacity(24);
         if let Some(v) = scene.vitals {
             self.vitals.prepare(queue, v);
             // Left rules at .9, as the prototype's `--fc`.
@@ -876,6 +953,10 @@ impl Renderer {
                 extra.push(rect(x + l.hair, y + l.hair, w - 2.0 * l.hair, h - 2.0 * l.hair, vitals::TIP_GROUND));
             }
         }
+        if let Some(p) = scene.panel {
+            self.vitals.prepare_panel(queue, p.key, &p.segs);
+            extra.extend(p.rects.iter().filter(|r| r.2 > 0.0).map(|&([x, y, w, h], c, a)| rgba_rect(x, y, w, h, c, a)));
+        }
         let mut labels = Vec::with_capacity(2);
         labels.extend(self.text.label.as_ref().map(|(_, b)| (*b, scene.label_alpha)));
         labels.extend(self.text.file_label.as_ref().map(|(_, b)| (*b, scene.file_label_alpha)));
@@ -884,7 +965,9 @@ impl Renderer {
             queue.write_buffer(&self.shapes, 0, bytemuck::cast_slice(&shapes));
         }
 
-        if self.text.prepare(device, queue, w, h, scene.view.palette, [scene.label_alpha, scene.file_label_alpha]) {
+        let (panel_alpha, clip) = scene.panel.map_or((0.0, f32::MAX), |p| (p.alpha, p.clip));
+        let fades = [scene.label_alpha, scene.file_label_alpha, panel_alpha];
+        if self.text.prepare(device, queue, w, h, scene.view.palette, fades, clip) {
             self.trimmed = false;
         }
         let n = shapes.len() as u32;
@@ -963,6 +1046,9 @@ impl Renderer {
         pass.set_pipeline(&self.shape);
         pass.set_vertex_buffer(0, self.shapes.slice(..));
         pass.draw(0..4, 0..count);
+        if let Some(p) = scene.panel {
+            self.vitals.draw_panel(&mut pass, p.segs.len());
+        }
         if let Err(e) = self.text.renderer.render(&self.text.atlas, &self.text.viewport, &mut pass) {
             log::error!("text render: {e}");
         }

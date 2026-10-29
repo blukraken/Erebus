@@ -22,7 +22,9 @@
 //! `--zoom <n>` scales the output up n times.
 //!
 //! Stills and sequences show the vitals from a canned history; `--no-vitals` leaves them out
-//! and `--hover-vital ram|gpu|cpu` shows that row's tooltip.
+//! and `--hover-vital ram|gpu|cpu` shows that row's tooltip. `--vitals-panel ram|gpu|cpu`
+//! shows the vitals panel open on that row; a frame sequence plays it being built, and
+//! `--vitals-panel-close <s>` has the sequence close it that many seconds in.
 //!
 //! `--frames <dir> [--duration <s>] [--fps <n>]` replaces the still with a consecutive
 //! sequence, `dir/frame_00000.png` onward, stepping the clock 1/fps per frame from `--time`.
@@ -36,6 +38,7 @@ mod instance;
 mod knot;
 mod link;
 mod logfile;
+mod panel;
 mod render;
 mod shot;
 mod vitals;
@@ -49,7 +52,7 @@ const USAGE: &str = "usage: erebus-face [--windowed] [--trace] [--idle-present <
                      [--close-hover|--close-press] [--windowed-chrome] [--context <json>] [--time <s>] \
                      [--hover-knot] [--flare branch|head|changed] [--glance] [--reduced-motion] [--bench <n>] \
                      [--files <json>] [--commit-at <s>] [--commit-count <n>] [--hover-file <path>] \
-                     [--crop WxH[+X+Y]] [--zoom <n>] [--no-vitals] [--hover-vital ram|gpu|cpu] \
+                     [--crop WxH[+X+Y]] [--zoom <n>] [--no-vitals] [--hover-vital ram|gpu|cpu] \n                     [--vitals-panel ram|gpu|cpu] [--vitals-panel-close <s>] \
                      | --frames <dir> [--duration <s>] [--fps <n>] [screenshot options]";
 
 fn parse_size(flag: &str, v: &str) -> Result<(u32, u32), String> {
@@ -154,6 +157,11 @@ fn parse(args: &[String]) -> Result<Mode, String> {
                 let v = value()?;
                 knot.hover_vital = Some(vitals::Row::parse(v).ok_or(format!("bad --hover-vital {v}"))?);
             }
+            "--vitals-panel" => {
+                let v = value()?;
+                knot.vitals_panel = Some(vitals::Row::parse(v).ok_or(format!("bad --vitals-panel {v}"))?);
+            }
+            "--vitals-panel-close" => knot.vitals_panel_close = Some(parse_secs(a, value()?, 0.0..=600.0)?),
             "--palette" => view.palette = true,
             "--link" => {
                 view.link = match value()?.as_str() {

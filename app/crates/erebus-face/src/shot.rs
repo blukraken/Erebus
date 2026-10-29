@@ -4,6 +4,7 @@
 use crate::app::{context_files, context_text};
 use crate::gpu::Gpu;
 use crate::knot::{self, Flare, Sim};
+use crate::panel::{self, Panel};
 use crate::render::{Renderer, Scene, View};
 use crate::vitals::{self, Vitals};
 use erebus_protocol::{ChangedFile, Context};
@@ -54,6 +55,10 @@ pub struct KnotShot {
     pub no_vitals: bool,
     /// Shows this vitals row's tooltip.
     pub hover_vital: Option<vitals::Row>,
+    /// Opens the vitals panel on this row: fully open in a still, unfolding in a sequence.
+    pub vitals_panel: Option<vitals::Row>,
+    /// A sequence closes the panel this many seconds in.
+    pub vitals_panel_close: Option<f64>,
 }
 
 /// How far into a `--flare` the still is taken.
@@ -226,10 +231,17 @@ pub fn run(shot: &Shot) -> Result<(), String> {
     vt.hover = k.hover_vital;
     vt.snap();
     let column = vitals::column(w, h, 1.0);
+    let mut vpanel = Panel::default();
+    if let Some(row) = k.vitals_panel {
+        vpanel.toggle(row);
+    }
+    let panel_frame = |p: &Panel, vt: &Vitals| panel::frame(p, vt, column.as_ref()?, (w, h), false, k.reduced);
 
     let mut renderer = Renderer::new(&gpu.device, &gpu.queue, format);
     let Some(frames) = &shot.frames else {
+        vpanel.snap();
         let vf = vt.frame(column.as_ref(), now_ms, (w, h), k.reduced);
+        let pf = panel_frame(&vpanel, &vt);
         let more = if live { sim.files.more() } else { None };
         let file_label = file_label(&sim, k, centre, r);
         let scene = Scene {
@@ -244,6 +256,7 @@ pub fn run(shot: &Shot) -> Result<(), String> {
             file_label_alpha: sim.file_hover(),
             more: more.as_deref(),
             vitals: vf.as_ref(),
+            panel: pf.as_ref(),
         };
         if k.bench > 0 {
             bench(&gpu, &mut renderer, &target.view, (w, h), &scene, &sim, k, &vt, now_ms);
@@ -265,6 +278,10 @@ pub fn run(shot: &Shot) -> Result<(), String> {
             now_ms = vitals::CANNED_T0 + 400 + ((k.time + f64::from(i) * dt) * 1000.0) as u64;
             feed_canned(&mut vt, now_ms);
             vt.step(dt as f32, k.reduced);
+            if k.vitals_panel_close.is_some_and(|at| f64::from(i) * dt >= at) {
+                vpanel.close();
+            }
+            vpanel.step(dt as f32, k.reduced);
         }
         if pending.is_some_and(|at| f64::from(i) * dt >= at) {
             pending = None;
@@ -272,6 +289,7 @@ pub fn run(shot: &Shot) -> Result<(), String> {
         }
         let more = if live { sim.files.more() } else { None };
         let vf = vt.frame(column.as_ref(), now_ms, (w, h), k.reduced);
+        let pf = panel_frame(&vpanel, &vt);
         let scene = Scene {
             view: shot.view,
             knot: sim.uniform(w, h, 1.0, k.reduced),
@@ -284,6 +302,7 @@ pub fn run(shot: &Shot) -> Result<(), String> {
             file_label_alpha: sim.file_hover(),
             more: more.as_deref(),
             vitals: vf.as_ref(),
+            panel: pf.as_ref(),
         };
         let rgb = target.capture(&gpu, &mut renderer, &scene, crop)?;
         write_png(&frames.dir.join(format!("frame_{i:05}.png")), out_size, &zoom(rgb, cw, shot.zoom))?;
