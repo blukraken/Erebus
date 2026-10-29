@@ -615,7 +615,7 @@ impl Vitals {
             let tick_c = 40.0 + 50.0 * f;
             let (a, b) = (at(t, rr + i.q), at(t, rr + 5.0 * i.q));
             out.push(if s.gpu && tick_c <= temp {
-                let c = if tick_c > 80.0 { theme::VERM } else { mix(theme::DIM, theme::EMBER, (tick_c - 40.0) / 40.0) };
+                let c = if tick_c > 80.0 { theme::VERM } else { mix(theme::DIM, theme::EMBER, 0.3 + 0.7 * (tick_c - 40.0) / 40.0) };
                 seg(a, b, c, 0.85, lw)
             } else {
                 seg(a, b, theme::DIM, 0.45, lw)
