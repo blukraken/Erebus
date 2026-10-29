@@ -285,6 +285,8 @@ pub struct Vitals {
     means: Vec<f32>,
     phase: f64,
     motes: [f64; ROWS],
+    /// GPU nucleus turn, radians mod TAU; runs faster under load.
+    stir: f64,
     /// Drawn time, seconds; paces the text.
     clock: f64,
     text_at: Option<f64>,
@@ -375,6 +377,8 @@ impl Vitals {
                 let m = &mut self.motes[row as usize];
                 *m = (*m + dt * MOTE_RATE * (0.4 + 1.6 * v)) % 1.0;
             }
+            let u = f64::from(self.shown.util / 100.0).clamp(0.0, 1.0);
+            self.stir = (self.stir + dt * (0.12 + 1.1 * u)) % std::f64::consts::TAU;
         }
         self.clock += f64::from(dt);
         if self.text_at.is_none_or(|t| self.clock - t >= TEXT_EVERY) {
@@ -539,8 +543,8 @@ impl Vitals {
         Some(Frame { uniform, history, generation: self.generation, segs, text: TextFrame { rows, tip }, rules })
     }
 
-    /// Woven swatch: one crossing per GB, eight to a row. Lit crossings are in use; the
-    /// newest burns hot.
+    /// Woven swatch: one crossing per GB, eight to a row. Lit crossings are in use, and a
+    /// partly used GB shows as a smaller square. The newest burns hot with a halo.
     fn ram_inst(&self, i: &Inst, out: &mut Vec<Seg>) {
         let total = gb(self.ram_total_mb()).ceil().max(1.0) as usize;
         let rows = total.div_ceil(8);
@@ -579,17 +583,20 @@ impl Vitals {
             let (r, c) = (k / 8, k % 8);
             let (bx, by) = (x0 + cs * (c as f32 + 0.5), y0 + sh - cs * (r as f32 + 0.5));
             let fill = (used - k as f32).clamp(0.0, 1.0);
-            out.push(if fill > 0.0 {
-                let c = if k + 1 == top { theme::HOT } else { theme::BONE_2 };
-                dot(bx, by, cs * 0.32, c, 0.35 + 0.6 * quant(fill, 32.0))
+            let size = cs * (0.18 + 0.14 * quant(fill, 32.0));
+            if fill <= 0.0 {
+                out.push(dot(bx, by, cs * 0.18, theme::DIM, 0.5));
+            } else if k + 1 == top {
+                out.push(dot(bx, by, cs * 0.62, theme::EMBER, 0.22));
+                out.push(dot(bx, by, size * 1.15, theme::HOT_CORE, 1.0));
             } else {
-                dot(bx, by, cs * 0.18, theme::DIM, 0.5)
-            });
+                out.push(dot(bx, by, size, theme::BONE_2, 0.8));
+            }
         }
     }
 
-    /// VRAM ring, one tick per GB, around a utilisation arc with a hot tip. The ring's gap
-    /// faces the braid and holds the temperature arc.
+    /// VRAM ring, one tick per GB, around a hot nucleus that swells, heats and stirs with
+    /// utilisation. The ring's gap faces the braid and holds the temperature arc.
     fn gpu_inst(&self, i: &Inst, out: &mut Vec<Seg>) {
         let s = &self.shown;
         let (cx, cy) = (i.x + i.w * 0.5, i.y + i.h * 0.5);
@@ -622,26 +629,33 @@ impl Vitals {
             });
         }
 
-        let ri = rr * 0.62;
-        let n = 48;
-        let track = (0.8 * i.q).max(i.px);
+        // Nucleus: dots on a sunflower spiral inside a radius that grows with load. Inner
+        // dots run white-hot, outer ones ember; each turns at 1-3x the stir clock, so the
+        // pattern wraps without a seam.
+
+        let u = if s.gpu { quant(s.util / 100.0, 400.0).clamp(0.0, 1.0) } else { 0.0 };
+        let reach = rr * (0.16 + 0.62 * u.sqrt());
+        let dd = (1.5 * i.q).max(i.px);
+        let n = 110;
+        let golden = PI * (3.0 - 5f32.sqrt());
+        let stir = self.stir as f32;
         for k in 0..n {
-            let (t0, t1) = (start + sweep * k as f32 / n as f32, start + sweep * (k + 1) as f32 / n as f32);
-            out.push(seg(at(t0, ri), at(t1, ri), theme::DIM, 0.35, track));
+            let f = (k as f32 + 0.5) / n as f32;
+            let m = (k % 3 + 1) as f32 * if k % 2 == 0 { 1.0 } else { -1.0 };
+            let breathe = 1.0 + (0.06 + 0.1 * u) * (stir * 2.0 + k as f32 * 1.7).sin();
+            let r = reach * f.sqrt() * breathe;
+            let t = k as f32 * golden + stir * m;
+            let heat = (1.0 - f) * (0.4 + 0.6 * u);
+            let (c, a) = if s.gpu {
+                (mix(theme::EMBER, theme::HOT, heat * 1.4), 0.3 + 0.6 * u * (1.0 - 0.5 * f) + 0.1 * (1.0 - f))
+            } else {
+                (theme::DIM, 0.4)
+            };
+            out.push(dot(cx + t.cos() * r, cy + t.sin() * r, dd, c, a.min(1.0)));
         }
-        if !s.gpu {
-            return;
+        if s.gpu {
+            out.push(dot(cx, cy, rr * (0.08 + 0.12 * u), theme::HOT_CORE, 0.35 + 0.6 * u));
         }
-        let u = quant(s.util / 100.0, 400.0).clamp(0.0, 1.0);
-        let end = start + sweep * u;
-        let steps = ((n as f32 * u).ceil() as usize).max(1);
-        let arc = (2.2 * i.q).max(i.px);
-        for k in 0..steps {
-            let (t0, t1) = (start + (end - start) * k as f32 / steps as f32, start + (end - start) * (k + 1) as f32 / steps as f32);
-            out.push(seg(at(t0, ri), at(t1, ri), theme::EMBER, 0.9, arc));
-        }
-        let [tx, ty] = at(end, ri);
-        out.push(dot(tx, ty, arc * 1.7, theme::HOT, 0.95));
     }
 
     /// One tick column per logical core, ten ticks each. The top lit tick is hot; a core
@@ -996,13 +1010,13 @@ mod tests {
         let col = column(5120, 1440, 1.0).unwrap();
         let f = v.frame(Some(&col), CANNED_T0 + 400, (5120, 1440), false).unwrap();
         assert!(f.segs.len() < MAX_SEGS);
-        // RAM: 31 crossings in an 8 × 4 swatch, one per GB.
+        // RAM: 31 crossings in an 8 × 4 swatch, one per GB, plus the newest one's halo.
         let mut r = Vitals::default();
         let mut out = Vec::new();
         r.ingest(Msg { hw: canned_hw(), samples: vec![canned_sample(0)] });
         r.ram_inst(&Inst { x: 0.0, y: 0.0, w: 190.0, h: 130.0, q: 2.0, px: 1.0 }, &mut out);
         let threads = 8 * 8 + 4 * 16;
-        assert_eq!(out.len() - threads, 31);
+        assert_eq!(out.len() - threads, 31 + 1);
         // CPU: 32 columns of 10.
         out.clear();
         r.cpu_inst(&Inst { x: 0.0, y: 0.0, w: 190.0, h: 145.0, q: 2.0, px: 1.0 }, &mut out);

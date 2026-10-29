@@ -36,8 +36,8 @@ const LOD_SECS: f32 = 0.5;
 const HOVER_SECS: f32 = 0.18;
 /// Shell turn per ambient millisecond.
 const TURN: f64 = 0.00016;
-/// Head travel per ambient millisecond: one loop in 5.5 s while live, 0.35x that dormant.
-const HEAD: f64 = TAU / 5500.0;
+/// Head travel per ambient millisecond: one loop in 11 s while live, 0.35x that dormant.
+const HEAD: f64 = TAU / 11000.0;
 /// Dots in each head cluster; the rest of the trefoil is trail.
 const HEAD_N: usize = 70;
 /// Haze dots drawn at full detail; Glance fades out every other one.

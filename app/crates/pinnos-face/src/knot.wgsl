@@ -194,16 +194,17 @@ fn particle_vs(@builtin(vertex_index) vi: u32, d: PIn) -> POut {
                     b = (TRAIL_FLOOR + TRAIL_SPAN * u) * gap0 * gap1;
                     let fresh = min(behind0, behind1);
                     grow = 1.0 + 0.3 * (1.0 - smoothstep(0.0, 0.25, fresh));
-                    // Synapse: fires the instant the heads touch, then spreads and fades from
-                    // that point (~150 ms). `gap` turns from negative to positive at contact,
-                    // so nothing lights before it; the dark gaps ahead of the heads stay dark.
+                    // Synapse: a soft swell where the heads met. It rises over ~0.5 s after
+                    // contact, spreads along the strand and fades over ~1.5 s. `gap` turns
+                    // positive at contact, so nothing lights before it.
                     let gap = wrap_pi(h0 - h1);
                     let meet = h0 - 0.5 * gap;
-                    let spread = 0.03 + 0.12 * gap;
-                    let near = wrap_pi(t - meet) / max(spread, 0.03);
-                    let flash = 0.5 * step(0.0, gap) * exp(-gap / 0.35) * exp(-near * near) * gap0 * gap1;
-                    b += flash;
-                    hot = clamp(flash + 0.6 * pow(1.0 - fresh, 12.0), 0.0, 1.0);
+                    let spread = 0.06 + 0.2 * gap;
+                    let near = wrap_pi(t - meet) / max(spread, 0.06);
+                    let env = smoothstep(0.0, 0.55, gap) * exp(-max(gap, 0.0) / 0.9);
+                    let swell = 0.3 * env * exp(-near * near) * gap0 * gap1;
+                    b += swell;
+                    hot = clamp(0.5 * swell + 0.6 * pow(1.0 - fresh, 12.0), 0.0, 1.0);
                 }
             } else {
                 if reduced {
