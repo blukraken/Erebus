@@ -672,12 +672,15 @@ impl Vitals {
 
         let u = if s.gpu { quant(s.util / 100.0, 400.0).clamp(0.0, 1.0) } else { 0.0 };
         let reach = rr * (0.16 + 0.62 * u.sqrt());
-        let dd = (1.1 * i.q).max(1.5 * i.px);
+        let dd = (1.4 * i.q).max(2.6 * i.px);
         if s.gpu {
-            out.push(glow(cx, cy, reach * 2.6, theme::EMBER, 0.12 + 0.3 * u));
-            out.push(glow(cx, cy, reach * 1.1, theme::HOT, 0.15 + 0.45 * u));
+            out.push(glow(cx, cy, reach * 3.0, theme::EMBER, 0.3 + 0.2 * u));
+            out.push(glow(cx, cy, reach * 1.4, theme::HOT, 0.3 + 0.35 * u));
         }
-        let n = 110;
+
+        // Dot count follows the nucleus area, so a small idle nucleus stays sparse and legible.
+
+        let n = (18.0 + 92.0 * u) as usize;
         let golden = PI * (3.0 - 5f32.sqrt());
         let stir = self.stir as f32;
         for k in 0..n {
