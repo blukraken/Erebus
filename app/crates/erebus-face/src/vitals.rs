@@ -262,6 +262,14 @@ pub fn bead(x: f32, y: f32, size: f32, c: Rgb, alpha: f32) -> Seg {
     s
 }
 
+/// A soft stroke of full width `width` that fades to nothing at its edges. Laid end to end
+/// in equal lengths, neighbours cross-fade into one even band.
+pub fn soft(a: [f32; 2], b: [f32; 2], c: Rgb, alpha: f32, width: f32) -> Seg {
+    let mut s = seg(a, b, c, alpha, width);
+    s.width[1] = 3.0;
+    s
+}
+
 /// A soft round glow; `size` spans about five standard deviations.
 pub fn glow(x: f32, y: f32, size: f32, c: Rgb, alpha: f32) -> Seg {
     let mut s = seg([x, y], [x, y], c, alpha, size);
@@ -792,8 +800,8 @@ pub fn shader() -> String {
 /// Braid and instrument pipelines and their buffers. Each frame writes the uniform; the
 /// history and segments are written only when they change.
 ///
-/// Panel strokes share the instrument pipeline from a buffer of their own, drawn later,
-/// over the panel ground.
+/// Panel strokes and the network's strokes share the instrument pipeline from buffers of
+/// their own: the network's under the column, the panel's over the panel ground.
 pub struct Painter {
     braid: wgpu::RenderPipeline,
     segs: wgpu::RenderPipeline,
@@ -801,11 +809,13 @@ pub struct Painter {
     history: wgpu::Buffer,
     seg_buf: wgpu::Buffer,
     panel_buf: wgpu::Buffer,
+    net_buf: wgpu::Buffer,
     bind: wgpu::BindGroup,
     last_uniform: Option<Uniform>,
     last_generation: Option<u64>,
     last_segs: Vec<Seg>,
     last_panel: Option<u64>,
+    last_net: Option<u64>,
 }
 
 impl Painter {
@@ -822,6 +832,7 @@ impl Painter {
         let history = buffer("vitals history", 4 * ROWS * SLOTS, wgpu::BufferUsages::STORAGE | copy);
         let seg_buf = buffer("vitals segments", size_of::<Seg>() * MAX_SEGS, wgpu::BufferUsages::VERTEX | copy);
         let panel_buf = buffer("panel segments", size_of::<Seg>() * PANEL_SEGS, wgpu::BufferUsages::VERTEX | copy);
+        let net_buf = buffer("network segments", size_of::<Seg>() * PANEL_SEGS, wgpu::BufferUsages::VERTEX | copy);
 
         let entry = |binding, ty| wgpu::BindGroupLayoutEntry {
             binding,
@@ -891,11 +902,43 @@ impl Painter {
             history,
             seg_buf,
             panel_buf,
+            net_buf,
             bind,
             last_uniform: None,
             last_generation: None,
             last_segs: Vec::new(),
             last_panel: None,
+            last_net: None,
+        }
+    }
+
+    /// Writes a uniform holding only the target size, for strokes drawn before any vitals.
+    pub fn prepare_size(&mut self, queue: &wgpu::Queue, (w, h): (u32, u32)) {
+        let u = Uniform { size: [w as f32, h as f32, 0.0, 0.0], ..Default::default() };
+        if self.last_uniform.as_ref().is_none_or(|l| l.size != u.size) {
+            queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&u));
+            self.last_uniform = Some(u);
+        }
+    }
+
+    /// Writes the network's strokes when `key` changes.
+    pub fn prepare_net(&mut self, queue: &wgpu::Queue, key: u64, segs: &[Seg]) {
+        if self.last_net != Some(key) {
+            let n = segs.len().min(PANEL_SEGS);
+            if n > 0 {
+                queue.write_buffer(&self.net_buf, 0, bytemuck::cast_slice(&segs[..n]));
+            }
+            self.last_net = Some(key);
+        }
+    }
+
+    pub fn draw_net(&self, pass: &mut wgpu::RenderPass, count: usize) {
+        let n = count.min(PANEL_SEGS) as u32;
+        if n > 0 {
+            pass.set_bind_group(0, &self.bind, &[]);
+            pass.set_pipeline(&self.segs);
+            pass.set_vertex_buffer(0, self.net_buf.slice(..));
+            pass.draw(0..4, 0..n);
         }
     }
 

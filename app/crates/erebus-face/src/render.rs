@@ -16,7 +16,9 @@ use glyphon::{
 use crate::feed;
 use crate::files::{self, FileInst};
 use crate::gpu::Gpu;
+use crate::globes;
 use crate::knot;
+use crate::net;
 use crate::panel;
 use crate::vitals;
 use erebus_theme::{self as theme, Rgb};
@@ -68,6 +70,8 @@ pub struct Scene<'a> {
     pub panel: Option<&'a panel::Frame>,
     /// The live feed, while it has rows.
     pub feed: Option<&'a feed::Frame>,
+    /// Session and worker globes, while any show.
+    pub net: Option<&'a net::Frame>,
 }
 
 /// Window chrome in physical pixels, shared by drawing and hit testing.
@@ -782,6 +786,9 @@ pub struct Renderer {
     particles: wgpu::Buffer,
     particle_count: u32,
     vitals: vitals::Painter,
+    globes: globes::Painter,
+    /// The network's clock and detail, for the globes' uniform.
+    pub net_clock: f32,
     /// With timestamps on, a frame splits into three passes, before, during and after the
     /// vitals, each timed; see [`Renderer::time_passes`].
     timing: Option<Timing>,
@@ -985,6 +992,8 @@ impl Renderer {
             particles,
             particle_count: dots.len() as u32,
             vitals: vitals::Painter::new(device, format, ADDITIVE),
+            globes: globes::Painter::new(device, format, ADDITIVE),
+            net_clock: 0.0,
             timing: None,
             text: Text::new(device, queue, format),
             trimmed: true,
@@ -1036,6 +1045,13 @@ impl Renderer {
         self.text.layout_panel(scene.panel.map(|p| &p.text));
         self.text.layout_feed(scene.feed);
         let mut extra = Vec::with_capacity(48);
+        if let Some(n) = scene.net {
+            if scene.vitals.is_none() {
+                self.vitals.prepare_size(queue, (w, h));
+            }
+            self.globes.prepare(queue, (w, h), self.net_clock, scene.knot.state[1], &n.globes);
+            self.vitals.prepare_net(queue, n.key, &n.segs);
+        }
         if let Some(f) = scene.feed {
             extra.extend(f.washes.iter().map(|&([x, y, w, h], c, a)| fade_rect(x, y, w, h, c, a)));
             extra.extend(f.rects.iter().filter(|r| r.2 > 0.0).map(|&([x, y, w, h], c, a)| rgba_rect(x, y, w, h, c, a)));
@@ -1112,6 +1128,10 @@ impl Renderer {
         pass.set_pipeline(&self.ground);
         pass.draw(0..3, 0..1);
 
+        // Braids run under the knot, so they leave its nucleus from inside the shell.
+        if let Some(n) = scene.net {
+            self.vitals.draw_net(&mut pass, n.segs.len());
+        }
         pass.set_bind_group(0, &self.knot_bind, &[]);
         pass.set_pipeline(&self.knot_field);
         pass.draw(0..4, 0..1);
@@ -1124,6 +1144,9 @@ impl Renderer {
             pass.draw(0..4, 0..glyphs);
             pass.set_pipeline(&self.file_glyphs);
             pass.draw(0..4, 0..glyphs);
+        }
+        if scene.net.is_some() {
+            self.globes.draw(&mut pass);
         }
 
         if timing.is_some() {

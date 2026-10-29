@@ -153,6 +153,11 @@ impl Feed {
         }
     }
 
+    /// The session a row came from.
+    pub fn session_of(&self, id: u64) -> Option<&str> {
+        self.rows.iter().find(|r| r.id == id).map(|r| r.ev.session.as_str())
+    }
+
     /// Glides back to the live end.
     pub fn go_live(&mut self) {
         self.target = 0.0;

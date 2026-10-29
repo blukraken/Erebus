@@ -5,6 +5,7 @@ use crate::app::{context_files, context_text};
 use crate::feed::Feed;
 use crate::gpu::Gpu;
 use crate::knot::{self, Flare, Sim};
+use crate::net::{self, Net};
 use crate::panel::{self, Panel};
 use crate::render::{Renderer, Scene, View};
 use crate::vitals::{self, Vitals};
@@ -63,6 +64,11 @@ pub struct KnotShot {
     pub feed: Option<Vec<erebus_protocol::FeedEvent>>,
     /// Scrolls the feed back this many rows and lets the wheel rest, so the live chip shows.
     pub feed_scroll: Option<f32>,
+    /// Session globes. A sequence can flip the second session busy (the knot pulls it in)
+    /// and later let the first go, as if it had been idle past the release time.
+    pub sessions: Option<Vec<erebus_protocol::SessionInfo>>,
+    pub sessions_busy_at: Option<f64>,
+    pub sessions_release_at: Option<f64>,
 }
 
 /// How far into a `--flare` the still is taken.
@@ -251,6 +257,16 @@ pub fn run(shot: &Shot) -> Result<(), String> {
         }
     }
     let feed_frame = |f: &Feed| f.frame(column.as_ref()?, k.reduced);
+    let mut net_ms = vitals::CANNED_T0;
+    let mut vnet = Net::new();
+    let area = column.as_ref().map(|c| net::Area::new(c, w, h, knot::radius(w, h, 1.0)));
+    if let Some(a) = area {
+        vnet.set_area(a);
+    }
+    if let Some(s) = &k.sessions {
+        vnet.ingest_sessions(s, net_ms);
+    }
+    let net_frame = |n: &Net| n.frame(area.as_ref()?, k.reduced);
 
     let mut renderer = Renderer::new(&gpu.device, &gpu.queue, format);
     let Some(frames) = &shot.frames else {
@@ -258,6 +274,7 @@ pub fn run(shot: &Shot) -> Result<(), String> {
         let vf = vt.frame(column.as_ref(), now_ms, (w, h), k.reduced);
         let pf = panel_frame(&vpanel, &vt);
         let ff = feed_frame(&feed);
+        let nf = net_frame(&vnet);
         let more = if live { sim.files.more() } else { None };
         let file_label = file_label(&sim, k, centre, r);
         let scene = Scene {
@@ -274,6 +291,7 @@ pub fn run(shot: &Shot) -> Result<(), String> {
             vitals: vf.as_ref(),
             panel: pf.as_ref(),
             feed: ff.as_ref(),
+            net: nf.as_ref(),
         };
         if k.bench > 0 {
             bench(&gpu, &mut renderer, &target.view, (w, h), &scene, &sim, k, &vt, now_ms);
@@ -297,6 +315,23 @@ pub fn run(shot: &Shot) -> Result<(), String> {
             vt.step(dt as f32, k.reduced);
             vpanel.step(dt as f32, k.reduced);
             feed.step(dt as f32, k.reduced);
+            net_ms += (dt * 1000.0) as u64;
+            vnet.step(dt as f32, k.reduced, net_ms);
+            renderer.net_clock += dt as f32;
+        }
+        let at = f64::from(i) * dt;
+        if let Some(s) = k.sessions.as_ref().filter(|_| k.sessions_busy_at.is_some_and(|t| at >= t && at - dt < t)) {
+            let mut s = s.clone();
+            if let Some(x) = s.get_mut(1) {
+                x.status = erebus_protocol::SessionStatus::Busy;
+            }
+            vnet.ingest_sessions(&s, net_ms);
+        }
+        if let Some(s) = k.sessions.as_ref().filter(|_| k.sessions_release_at.is_some_and(|t| at >= t && at - dt < t)) {
+            let mut s = s.clone();
+            s[0].status = erebus_protocol::SessionStatus::Idle;
+            net_ms += net::RELEASE_AFTER;
+            vnet.ingest_sessions(&s, net_ms);
         }
         let due = (f64::from(i) * dt / 0.8).floor() as usize;
         if !held.is_empty() && hold - held.len() < due {
@@ -310,6 +345,7 @@ pub fn run(shot: &Shot) -> Result<(), String> {
         let vf = vt.frame(column.as_ref(), now_ms, (w, h), k.reduced);
         let pf = panel_frame(&vpanel, &vt);
         let ff = feed_frame(&feed);
+        let nf = net_frame(&vnet);
         let scene = Scene {
             view: shot.view,
             knot: sim.uniform(w, h, 1.0, k.reduced),
@@ -324,6 +360,7 @@ pub fn run(shot: &Shot) -> Result<(), String> {
             vitals: vf.as_ref(),
             panel: pf.as_ref(),
             feed: ff.as_ref(),
+            net: nf.as_ref(),
         };
         let rgb = target.capture(&gpu, &mut renderer, &scene, crop)?;
         write_png(&frames.dir.join(format!("frame_{i:05}.png")), out_size, &zoom(rgb, cw, shot.zoom))?;

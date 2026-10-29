@@ -77,6 +77,8 @@ pub struct SessionInfo {
 pub enum SessionStatus {
     Busy,
     Idle,
+    /// Between turns, waiting on an outside program the session started.
+    Waiting,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -42,6 +42,7 @@ use crate::feed::{self, Feed};
 use crate::gpu::Gpu;
 use crate::knot;
 use crate::link::{self, Link, LinkEvent};
+use crate::net::{self, Net};
 use crate::panel::{self, Panel};
 use crate::render::{self, Close, Renderer, Scene, View};
 use crate::vitals::{self, Vitals};
@@ -115,7 +116,7 @@ pub enum UiEvent {
 }
 
 /// What the cursor is over.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum Hit {
     None,
     Close,
@@ -129,6 +130,8 @@ enum Hit {
     Collapse,
     /// The live feed: a row, the live chip, or the ground between rows.
     Feed(feed::Spot),
+    /// A session's globe.
+    Globe(String),
 }
 
 struct Live {
@@ -217,6 +220,7 @@ struct App {
     panel: Panel,
     collapse_hover: bool,
     feed: Feed,
+    net: Net,
 }
 
 pub fn run(opts: Options) -> Result<(), String> {
@@ -278,6 +282,7 @@ pub fn run(opts: Options) -> Result<(), String> {
         panel: Panel::default(),
         collapse_hover: false,
         feed: Feed::new(),
+        net: Net::new(),
     };
     app.reduced = app.opts.reduced_motion || animations_off();
     log::info!("reduced motion {}", if app.reduced { "on" } else { "off" });
@@ -576,6 +581,7 @@ impl App {
             self.vitals.snap();
             self.panel.snap();
             self.feed.snap();
+            self.net.snap();
             self.last_sim = now;
             self.redraw("resumed");
         }
@@ -605,7 +611,7 @@ impl App {
 
     /// Animation frames are due: the knot moves, or a transition runs.
     fn animating(&self) -> bool {
-        self.state.state != RenderState::Suspended && (!self.reduced || self.sim.busy() || self.panel.busy() || self.feed.busy())
+        self.state.state != RenderState::Suspended && (!self.reduced || self.sim.busy() || self.panel.busy() || self.feed.busy() || self.net.busy())
     }
 
     /// Hover hit on the knot: inside 0.9 of its radius, as in the prototype.
@@ -762,6 +768,10 @@ impl App {
         if let Some(spot) = self.feed.hit(&col, x, y) {
             return Hit::Feed(spot);
         }
+        let area = net::Area::new(&col, cw, ch, knot::radius(cw, ch, scale));
+        if let Some(id) = self.net.hit(&area, x, y) {
+            return Hit::Globe(id);
+        }
         col.hit(x, y).map_or(Hit::None, Hit::Vital)
     }
 
@@ -857,8 +867,13 @@ impl App {
         }
         self.cursor = Some(p);
         let hit = self.hit(p);
+        let globe = if let Hit::Globe(id) = &hit { Some(id.clone()) } else { None };
+        if globe != self.net.hover {
+            self.net.hover = globe;
+            self.redraw("globe hover");
+        }
         let row = if let Hit::Feed(feed::Spot::Row(id)) = hit { Some(id) } else { None };
-        let chip = hit == Hit::Feed(feed::Spot::Chip);
+        let chip = matches!(hit, Hit::Feed(feed::Spot::Chip));
         if row != self.feed.hover || chip != self.feed.chip_hover {
             self.feed.hover = row;
             self.feed.chip_hover = chip;
@@ -950,7 +965,14 @@ impl App {
                 self.feed.go_live();
                 self.redraw("feed live");
             }
-            Hit::Panel | Hit::Feed(_) | Hit::None => {}
+            Hit::Feed(feed::Spot::Row(id)) => {
+                if let Some(s) = self.feed.session_of(id).map(str::to_string) {
+                    log::info!("feed: ping {s}");
+                    self.net.ping(&s);
+                    self.redraw("ping");
+                }
+            }
+            Hit::Panel | Hit::Feed(_) | Hit::Globe(_) | Hit::None => {}
         }
     }
 
@@ -963,6 +985,7 @@ impl App {
         let dt = now.duration_since(self.last_sim).as_secs_f32();
         self.last_sim = now;
         self.sim.step(dt, self.reduced);
+        self.net.step(dt, self.reduced, unix_ms());
         self.vitals.step(dt, self.reduced);
         self.panel.step(dt, self.reduced);
         self.feed.step(dt, self.reduced);
@@ -1010,6 +1033,13 @@ impl App {
         let crumbs: Vec<&str> = self.crumbs.iter().map(String::as_str).collect();
         let column = vitals::column(w, h, scale);
         let vitals = self.vitals.frame(column.as_ref(), unix_ms(), (w, h), self.reduced);
+        let area = column.as_ref().map(|c| net::Area::new(c, w, h, knot::radius(w, h, scale)));
+        if let Some(a) = area {
+            self.net.set_area(a);
+        }
+        let net = area.as_ref().and_then(|a| self.net.frame(a, self.reduced));
+        // A globe's name chip shares the file label's box when no file is hovered.
+        let globe_label = net.as_ref().and_then(|n| n.label.as_ref()).filter(|_| self.sim.hovered.is_none());
         let panel = column.as_ref().and_then(|c| panel::frame(&self.panel, &self.vitals, c, (w, h), self.collapse_hover, self.reduced));
         let feed = column.as_ref().and_then(|c| self.feed.frame(c, self.reduced));
         let scene = Scene {
@@ -1020,13 +1050,19 @@ impl App {
             label_alpha: self.sim.hover(),
             files: self.sim.files.instances(),
             files_gen: self.sim.files.generation,
-            file_label: self.file_label.as_ref().map(|(p, at)| (p.as_str(), *at)),
-            file_label_alpha: self.sim.file_hover(),
+            file_label: match globe_label {
+                Some(l) => Some((l.text.as_str(), l.at)),
+                None => self.file_label.as_ref().map(|(p, at)| (p.as_str(), *at)),
+            },
+            file_label_alpha: globe_label.map_or(self.sim.file_hover(), |l| l.alpha),
             more: more.as_deref(),
             vitals: vitals.as_ref(),
             panel: panel.as_ref(),
             feed: feed.as_ref(),
+            net: net.as_ref(),
         };
+        // Wraps on whole turns of the core's jitter, which runs at three radians a second.
+        renderer.net_clock = (renderer.net_clock + dt) % (std::f32::consts::TAU / 3.0 * 1000.0);
         renderer.draw(gpu, &mut encoder, &target, (w, h), scale, &scene);
         gpu.queue.submit([encoder.finish()]);
         window.pre_present_notify();
@@ -1188,6 +1224,7 @@ impl ApplicationHandler<UiEvent> for App {
                     self.vitals.clear();
                     self.panel = Panel::default();
                     self.feed.clear();
+                    self.net.clear();
                 }
                 if up != self.link_up {
                     self.link_up = up;
@@ -1217,8 +1254,13 @@ impl ApplicationHandler<UiEvent> for App {
             LinkEvent::Sessions(sessions) => {
                 let workers: usize = sessions.iter().map(|s| s.workers.len()).sum();
                 log::info!("sessions: {} live, {workers} workers", sessions.len());
+                self.net.ingest_sessions(&sessions, unix_ms());
+                if self.state.state != RenderState::Suspended && !self.animating() {
+                    self.redraw("sessions");
+                }
             }
             LinkEvent::Feed(events) => {
+                self.net.note_activity(&events);
                 self.feed.ingest(events);
                 if self.state.state != RenderState::Suspended && !self.animating() {
                     self.redraw("feed");

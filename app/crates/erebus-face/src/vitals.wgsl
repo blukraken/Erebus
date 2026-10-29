@@ -211,7 +211,11 @@ fn seg_vs(@builtin(vertex_index) i: u32, s: SegIn) -> SegOut {
     let n = vec2f(-dir.y, dir.x);
     let hw = s.width.x * 0.5;
     let corner = vec2f(f32(i & 1u), f32((i >> 1u) & 1u));
-    let cap = select(1.0, hw + 1.0, s.width.y > 0.5);
+    // Dots and glows cap at their radius; soft strokes overlap each neighbour by half a length.
+    var cap = select(1.0, hw + 1.0, s.width.y > 0.5);
+    if s.width.y > 2.5 {
+        cap = len * 0.5;
+    }
     let along = mix(-cap, len + cap, corner.x);
     let across = mix(-hw - 1.0, hw + 1.0, corner.y);
     var out: SegOut;
@@ -224,6 +228,14 @@ fn seg_vs(@builtin(vertex_index) i: u32, s: SegIn) -> SegOut {
 
 @fragment
 fn seg_fs(in: SegOut) -> @location(0) vec4f {
+    // Soft strokes fall off smoothly across, and ramp in and out along over a whole length,
+    // so neighbours along a path sum to an even glow with no corners.
+    if in.dims.z > 2.5 {
+        let q = clamp(1.0 - abs(in.local.y) / max(in.dims.y, 1.0), 0.0, 1.0);
+        let len = max(in.dims.x, 1e-3);
+        let along = clamp(min(in.local.x + len * 0.5, len * 1.5 - in.local.x) / len, 0.0, 1.0);
+        return vec4f(in.color.rgb * q * q * along, 0.0);
+    }
     // Dots and glows are measured from the centre, so they come out round.
     if in.dims.z > 0.5 {
         let r = length(vec2f(in.local.x - in.dims.x * 0.5, in.local.y));

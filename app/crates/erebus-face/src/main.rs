@@ -27,6 +27,9 @@
 //! `--feed <json>` fills the live feed from a JSON array of protocol `FeedEvent`, or
 //! `--feed canned` from a built-in set; a sequence delivers the last three live.
 //! `--feed-scroll <rows>` scrolls it back that far, showing the live chip.
+//! `--sessions <json>|canned` shows session globes from a JSON array of protocol
+//! `SessionInfo`; in a sequence `--sessions-busy-at <s>` turns the second session busy and
+//! `--sessions-release-at <s>` lets the first go.
 //!
 //! `--frames <dir> [--duration <s>] [--fps <n>]` replaces the still with a consecutive
 //! sequence, `dir/frame_00000.png` onward, stepping the clock 1/fps per frame from `--time`.
@@ -36,11 +39,13 @@
 mod app;
 mod feed;
 mod files;
+mod globes;
 mod gpu;
 mod instance;
 mod knot;
 mod link;
 mod logfile;
+mod net;
 mod panel;
 mod render;
 mod shot;
@@ -55,7 +60,7 @@ const USAGE: &str = "usage: erebus-face [--windowed] [--trace] [--idle-present <
                      [--close-hover|--close-press] [--windowed-chrome] [--context <json>] [--time <s>] \
                      [--hover-knot] [--flare branch|head|changed] [--glance] [--reduced-motion] [--bench <n>] \
                      [--files <json>] [--commit-at <s>] [--commit-count <n>] [--hover-file <path>] \
-                     [--crop WxH[+X+Y]] [--zoom <n>] [--no-vitals] [--hover-vital ram|gpu|cpu] \n                     [--vitals-panel ram|gpu|cpu] [--feed <json>|canned] [--feed-scroll <rows>] \
+                     [--crop WxH[+X+Y]] [--zoom <n>] [--no-vitals] [--hover-vital ram|gpu|cpu] \n                     [--vitals-panel ram|gpu|cpu] [--feed <json>|canned] [--feed-scroll <rows>]                      [--sessions <json>|canned] [--sessions-busy-at <s>] [--sessions-release-at <s>] \
                      | --frames <dir> [--duration <s>] [--fps <n>] [screenshot options]";
 
 fn parse_size(flag: &str, v: &str) -> Result<(u32, u32), String> {
@@ -174,6 +179,17 @@ fn parse(args: &[String]) -> Result<Mode, String> {
                 });
             }
             "--feed-scroll" => knot.feed_scroll = Some(parse_secs(a, value()?, 0.0..=1000.0)? as f32),
+            "--sessions" => {
+                let v = value()?;
+                knot.sessions = Some(if v == "canned" {
+                    net::canned()
+                } else {
+                    let text = std::fs::read_to_string(v.as_str()).map_err(|e| format!("--sessions {v}: {e}"))?;
+                    serde_json::from_str(&text).map_err(|e| format!("--sessions {v}: {e}"))?
+                });
+            }
+            "--sessions-busy-at" => knot.sessions_busy_at = Some(parse_secs(a, value()?, 0.0..=600.0)?),
+            "--sessions-release-at" => knot.sessions_release_at = Some(parse_secs(a, value()?, 0.0..=600.0)?),
             "--palette" => view.palette = true,
             "--link" => {
                 view.link = match value()?.as_str() {

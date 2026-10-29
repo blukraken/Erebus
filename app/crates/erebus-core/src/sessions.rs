@@ -513,11 +513,12 @@ impl SessionFile {
     }
 }
 
+/// `shell` means the session waits on an outside program it started.
 fn status_of_str(s: Option<&str>) -> SessionStatus {
-    if s == Some("busy") {
-        SessionStatus::Busy
-    } else {
-        SessionStatus::Idle
+    match s {
+        Some("busy") => SessionStatus::Busy,
+        Some("shell") => SessionStatus::Waiting,
+        _ => SessionStatus::Idle,
     }
 }
 
@@ -1972,6 +1973,14 @@ fn allocate(base: &str, taken: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_session_on_a_shell_is_waiting() {
+        assert_eq!(status_of_str(Some("busy")), SessionStatus::Busy);
+        assert_eq!(status_of_str(Some("shell")), SessionStatus::Waiting);
+        assert_eq!(status_of_str(Some("idle")), SessionStatus::Idle);
+        assert_eq!(status_of_str(None), SessionStatus::Idle);
+    }
 
     fn session(label: &str) -> Session {
         let f = SessionFile {
