@@ -1,16 +1,23 @@
-//! One render pass: ground, shapes, then text. The window and screenshot mode both draw
-//! through [`Renderer::draw`], so their pixels match.
+//! One render pass: ground, knot, shapes, then text. The window and screenshot mode both
+//! draw through [`Renderer::draw`], so their pixels match.
 //!
 //! Sizes follow the prototype's `resize()` in `v3/concept-loom4.html`: at 5120×1440 one
 //! prototype CSS pixel is 1.45 physical pixels.
+//!
+//! A frame uploads the ground and knot uniforms and the shape list, all under 2 KB. The
+//! file glyph buffer is written only when the file list changes. Text is laid out and
+//! prepared only when its words, size or fade change.
 
 use bytemuck::{Pod, Zeroable};
 use glyphon::{
     Attrs, Buffer, Cache, Color, ColorMode, Family, FontSystem, Metrics, Resolution, Shaping,
     SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight, Wrap,
 };
+use crate::files::{self, FileInst};
 use crate::gpu::Gpu;
+use crate::knot;
 use pinnos_theme::{self as theme, Rgb};
+use wgpu::util::DeviceExt;
 
 /// Every frame renders into this format family: unorm targets holding sRGB values.
 pub fn is_target_format(f: wgpu::TextureFormat) -> bool {
@@ -32,6 +39,26 @@ pub struct View {
     /// Link bead state: 0 down, 1 up, eased in between.
     pub link: f32,
     pub close: Close,
+}
+
+/// Everything one frame draws.
+#[derive(Clone, Copy)]
+pub struct Scene<'a> {
+    pub view: View,
+    pub knot: knot::Uniform,
+    /// Wordmark crumbs after "PinnOS", e.g. `["dev", "PinnOS"]`.
+    pub crumbs: &'a [&'a str],
+    /// The knot's hover label and its fade, 0..1.
+    pub label: Option<&'a str>,
+    pub label_alpha: f32,
+    /// File glyphs, and the generation that names their contents.
+    pub files: &'a [FileInst],
+    pub files_gen: u64,
+    /// A hovered file's path, the glyph centre it labels, and its fade.
+    pub file_label: Option<(&'a str, [f32; 2])>,
+    pub file_label_alpha: f32,
+    /// `+N` for files the core counts but does not list.
+    pub more: Option<&'a str>,
 }
 
 /// Window chrome in physical pixels, shared by drawing and hit testing.
@@ -59,7 +86,7 @@ const KIND_BEAD: f32 = 1.0;
 const KIND_CLOSE: f32 = 2.0;
 
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, PartialEq, Pod, Zeroable)]
 struct Globals {
     size: [f32; 2],
     centre: [f32; 2],
@@ -71,7 +98,7 @@ struct Globals {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, PartialEq, Pod, Zeroable)]
 struct Shape {
     rect: [f32; 4],
     color: [f32; 4],
@@ -88,13 +115,19 @@ fn rect(x: f32, y: f32, w: f32, h: f32, c: Rgb) -> Shape {
     Shape { rect: [x, y, w, h], color: rgba(c, 1.0), color2: [0.0; 4], params: [KIND_RECT, 0.0, 0.0, 0.0] }
 }
 
-/// Ground-light peak above ink: mostly raised panel, a trace of ember. Matches the
-/// prototype's dormant backdrop, which peaks near (24, 21, 17).
-fn ground_light() -> [f32; 4] {
+/// Ground-light peak above ink. Dormant: mostly raised panel with a trace of ember, the
+/// prototype's dormant backdrop peaking near (24, 21, 17). Live: its warm backdrop,
+/// rgba(104, 58, 16, .5) over ink, peaking near (57, 34, 12). `live` blends the two.
+fn ground_light(live: f32) -> [f32; 4] {
     let ink = theme::INK.srgb_f32();
     let slab = theme::SLAB_2.srgb_f32();
     let ember = theme::EMBER.srgb_f32();
-    let ch = |i: usize| 1.25 * (slab[i] - ink[i]) + 0.015 * (ember[i] - ink[i]);
+    let warm = [104.0 / 255.0, 58.0 / 255.0, 16.0 / 255.0];
+    let ch = |i: usize| {
+        let dormant = 1.25 * (slab[i] - ink[i]) + 0.015 * (ember[i] - ink[i]);
+        let lit = 0.5 * (warm[i] - ink[i]);
+        dormant + (lit - dormant) * live
+    };
     [ch(0), ch(1), ch(2), 0.0]
 }
 
@@ -152,8 +185,20 @@ impl Layout {
     }
 }
 
-fn shapes(l: &Layout, view: View, strip_h: f32) -> Vec<Shape> {
+fn rgba_rect(x: f32, y: f32, w: f32, h: f32, c: Rgb, a: f32) -> Shape {
+    let [r, g, b] = c.srgb_f32();
+    Shape { rect: [x, y, w, h], color: [r * a, g * a, b * a, a], color2: [0.0; 4], params: [KIND_RECT, 0.0, 0.0, 0.0] }
+}
+
+/// `labels` are hover label boxes `[x, y, w, h]` and their fades.
+fn shapes(l: &Layout, view: View, strip_h: f32, labels: &[([f32; 4], f32)]) -> Vec<Shape> {
     let mut out = Vec::with_capacity(MAX_SHAPES);
+
+    // Hover label boxes: ink with a rule hairline, as the prototype's hovered `.lbl`.
+    for &([x, y, w, h], a) in labels.iter().filter(|(_, a)| *a > 0.0) {
+        out.push(rgba_rect(x, y, w, h, theme::RULE, a));
+        out.push(rgba_rect(x + l.hair, y + l.hair, w - 2.0 * l.hair, h - 2.0 * l.hair, theme::INK, a));
+    }
 
     if view.palette {
         let y0 = l.h - strip_h;
@@ -216,6 +261,10 @@ struct Placed {
 
 impl Placed {
     fn area(&self) -> TextArea<'_> {
+        self.area_alpha(1.0)
+    }
+
+    fn area_alpha(&self, a: f32) -> TextArea<'_> {
         let Rgb(r, g, b) = self.color;
         TextArea {
             buffer: &self.buf,
@@ -223,10 +272,21 @@ impl Placed {
             top: self.top,
             scale: 1.0,
             bounds: self.bounds,
-            default_color: Color::rgb(r, g, b),
+            default_color: Color::rgba(r, g, b, (a.clamp(0.0, 1.0) * 255.0).round() as u8),
             custom_glyphs: &[],
         }
     }
+}
+
+/// What the text was laid out for: target size and scale, wordmark crumbs, labels, `+N`.
+#[derive(Clone, PartialEq)]
+struct TextKey {
+    size: (u32, u32, u64),
+    crumbs: Vec<String>,
+    label: Option<String>,
+    /// File path and its glyph centre, whole pixels.
+    file_label: Option<(String, i32, i32)>,
+    more: Option<String>,
 }
 
 struct Text {
@@ -236,11 +296,16 @@ struct Text {
     atlas: TextAtlas,
     renderer: TextRenderer,
     mono: &'static str,
-    /// Target size and scale the buffers were laid out for.
-    key: Option<(u32, u32, u64)>,
+    key: Option<TextKey>,
+    /// Palette, label fades (in 1/255 steps) and layout of the last prepare.
+    prepared: Option<(bool, u8, u8, TextKey)>,
     /// Palette strip height, sized to its text.
     strip_h: f32,
     wordmark: Option<Placed>,
+    /// Hover labels and their boxes `[x, y, w, h]`.
+    label: Option<(Placed, [f32; 4])>,
+    file_label: Option<(Placed, [f32; 4])>,
+    more: Option<Placed>,
     cells: Vec<Placed>,
 }
 
@@ -309,28 +374,90 @@ impl Text {
             renderer,
             mono,
             key: None,
+            prepared: None,
             strip_h: 0.0,
             wordmark: None,
+            label: None,
+            file_label: None,
+            more: None,
             cells: Vec::new(),
         }
     }
 
-    fn layout(&mut self, l: &Layout, key: (u32, u32, u64)) {
-        if self.key == Some(key) {
+    /// Lays out the wordmark and label when their words change, and the strip when the
+    /// target size changes. `knot_r` places the label under the knot.
+    fn layout(&mut self, l: &Layout, key: TextKey, knot_r: f32) {
+        if self.key.as_ref() == Some(&key) {
             return;
         }
-        self.key = Some(key);
+        let resized = self.key.as_ref().is_none_or(|old| old.size != key.size);
         let k = l.k;
         let fonts = &mut self.fonts;
 
         // Wordmark: prototype `.brand b`, 600 13px, tracking .06em, caps centred on the bead.
+        // Crumbs follow in the regular weight.
         let (bx, by, br) = l.bead();
         let size = 13.0 * k;
-        let buf = line(fonts, "PinnOS", size, UI, Weight::SEMIBOLD, 0.06, None);
+        let mut buf = Buffer::new(fonts, Metrics::new(size, (size * 1.3).round()));
+        buf.set_wrap(Wrap::None);
+        buf.set_size(None, None);
+        let base = Attrs::new().family(Family::Name(UI)).letter_spacing(0.06);
+        let tail: String = key.crumbs.iter().map(|c| format!(" · {c}")).collect();
+        buf.set_rich_text(
+            [("PinnOS", base.clone().weight(Weight::SEMIBOLD)), (tail.as_str(), base.clone().weight(Weight::NORMAL))],
+            &base,
+            Shaping::Advanced,
+            None,
+        );
+        buf.shape_until_scroll(fonts, false);
         let left = (bx + br + 8.0 * k).round();
         let top = (by - baseline(&buf) + 0.35 * size).round();
         let b = bounds(left, top, l.w, top + height(&buf));
         self.wordmark = Some(Placed { buf, left, top, color: theme::BONE_2, bounds: b });
+
+        // Hover label: prototype `.lbl.hov .m`, mono 12.5px, centred under the knot at
+        // 1.22 r plus a 6px gap.
+        self.label = key.label.as_deref().map(|text| {
+            let buf = line(fonts, text, 12.5 * k, self.mono, Weight::NORMAL, 0.02, None);
+            let w = buf.layout_runs().map(|r| r.line_w).fold(0.0, f32::max);
+            let (px, py) = (7.0 * k, 3.0 * k);
+            let bw = (w + 2.0 * px).round();
+            let bh = (height(&buf) + 2.0 * py).round();
+            let bx = (l.w * 0.5 - bw * 0.5).round();
+            let by = (l.h * 0.5 + knot_r * 1.22 + 6.0 * k).round();
+            let (left, top) = (bx + px, by + py);
+            let b = bounds(left, top, left + w + 1.0, top + height(&buf));
+            (Placed { buf, left, top, color: theme::BONE_2, bounds: b }, [bx, by, bw, bh])
+        });
+
+        // File label: the same mono box, centred above the hovered glyph, kept on screen.
+        self.file_label = key.file_label.as_ref().map(|(text, gx, gy)| {
+            let buf = line(fonts, text, 12.5 * k, self.mono, Weight::NORMAL, 0.02, None);
+            let w = buf.layout_runs().map(|r| r.line_w).fold(0.0, f32::max);
+            let (px, py) = (7.0 * k, 3.0 * k);
+            let bw = (w + 2.0 * px).round();
+            let bh = (height(&buf) + 2.0 * py).round();
+            let bx = (*gx as f32 - bw * 0.5).clamp(l.pad, (l.w - l.pad - bw).max(l.pad)).round();
+            let above = *gy as f32 - 16.0 * k - bh;
+            let by = if above > 48.0 * k { above } else { *gy as f32 + 16.0 * k }.round();
+            let (left, top) = (bx + px, by + py);
+            let b = bounds(left, top, left + w + 1.0, top + height(&buf));
+            (Placed { buf, left, top, color: theme::BONE, bounds: b }, [bx, by, bw, bh])
+        });
+
+        // `+N`: small mono text low and right of the knot.
+        self.more = key.more.as_deref().map(|text| {
+            let buf = line(fonts, text, 12.0 * k, self.mono, Weight::NORMAL, 0.04, None);
+            let left = (l.w * 0.5 + knot_r * 1.6).round();
+            let top = (l.h * 0.5 + knot_r * 1.2).round();
+            let b = bounds(left, top, left + 120.0 * k, top + height(&buf));
+            Placed { buf, left, top, color: theme::BONE_3, bounds: b }
+        });
+
+        self.key = Some(key);
+        if !resized {
+            return;
+        }
 
         // Palette strip: per token, name / hex / role beside its swatch. Shaped first, so
         // the strip height can follow the tallest column.
@@ -371,9 +498,26 @@ impl Text {
         }
     }
 
-    fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, w: u32, h: u32, palette: bool) {
+    /// Prepares text when anything shown changed. Returns whether it did. `fades` are the
+    /// knot label's and the file label's.
+    fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, w: u32, h: u32, palette: bool, fades: [f32; 2]) -> bool {
+        let byte = |a: f32| (a.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let (fade, file_fade) = (byte(fades[0]), byte(fades[1]));
+        let Some(key) = self.key.clone() else { return false };
+        let state = (palette, fade, file_fade, key);
+        if self.prepared.as_ref() == Some(&state) {
+            return false;
+        }
+        self.prepared = Some(state);
         self.viewport.update(queue, Resolution { width: w, height: h });
         let mut areas: Vec<TextArea> = self.wordmark.iter().map(Placed::area).collect();
+        if let Some((p, _)) = self.label.as_ref().filter(|_| fade > 0) {
+            areas.push(p.area_alpha(fades[0]));
+        }
+        if let Some((p, _)) = self.file_label.as_ref().filter(|_| file_fade > 0) {
+            areas.push(p.area_alpha(fades[1]));
+        }
+        areas.extend(self.more.iter().map(Placed::area));
         if palette {
             areas.extend(self.cells.iter().map(Placed::area));
         }
@@ -388,6 +532,7 @@ impl Text {
         ) {
             log::error!("text prepare: {e}");
         }
+        true
     }
 }
 
@@ -397,20 +542,78 @@ pub struct Renderer {
     globals: wgpu::Buffer,
     shapes: wgpu::Buffer,
     bind: wgpu::BindGroup,
+    knot_field: wgpu::RenderPipeline,
+    knot_dots: wgpu::RenderPipeline,
+    file_glyphs: wgpu::RenderPipeline,
+    file_trails: wgpu::RenderPipeline,
+    /// File glyphs, written when their generation changes.
+    files: wgpu::Buffer,
+    files_gen: Option<u64>,
+    knot_uniform: wgpu::Buffer,
+    knot_bind: wgpu::BindGroup,
+    particles: wgpu::Buffer,
+    particle_count: u32,
     text: Text,
-    /// What the uploaded buffers and prepared text show, with the shape count.
-    prepared: Option<(View, u32, u32, u64, u32)>,
-    /// The atlas was trimmed after the last prepare.
+    /// The atlas was trimmed after the last text prepare.
     trimmed: bool,
+    /// Last uploads; a frame writes only what changed, since each write costs a copy at submit.
+    last_globals: Option<Globals>,
+    last_knot: Option<knot::Uniform>,
+    last_shapes: Vec<Shape>,
 }
+
+fn buffer_entry(binding: u32, ty: wgpu::BufferBindingType) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+        ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None },
+        count: None,
+    }
+}
+
+fn uniform_layout(device: &wgpu::Device, label: &str) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some(label),
+        entries: &[buffer_entry(0, wgpu::BufferBindingType::Uniform)],
+    })
+}
+
+fn uniform_buffer(device: &wgpu::Device, label: &str, size: usize) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: size as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+/// Adds light: each knot layer sums onto what is below, as the prototype's `lighter` does.
+const ADDITIVE: wgpu::BlendState = wgpu::BlendState {
+    color: wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::One,
+        dst_factor: wgpu::BlendFactor::One,
+        operation: wgpu::BlendOperation::Add,
+    },
+    alpha: wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::Zero,
+        dst_factor: wgpu::BlendFactor::One,
+        operation: wgpu::BlendOperation::Add,
+    },
+};
 
 impl Renderer {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
-        let module = device.create_shader_module(wgpu::include_wgsl!("face.wgsl"));
-        let globals = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("globals"),
-            size: size_of::<Globals>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        let face = device.create_shader_module(wgpu::include_wgsl!("face.wgsl"));
+        let knot_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("knot.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(knot::shader().into()),
+        });
+        let globals = uniform_buffer(device, "globals", size_of::<Globals>());
+        let knot_uniform = uniform_buffer(device, "knot", size_of::<knot::Uniform>());
+        let files = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("file glyphs"),
+            size: (size_of::<FileInst>() * files::CAP) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let shapes = device.create_buffer(&wgpu::BufferDescriptor {
@@ -419,36 +622,55 @@ impl Renderer {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("globals"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
+        let dots = knot::particles();
+        let particles = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("knot particles"),
+            contents: bytemuck::cast_slice(&dots),
+            usage: wgpu::BufferUsages::VERTEX,
         });
+
+        let bgl = uniform_layout(device, "globals");
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("globals"),
             layout: &bgl,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() }],
         });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("face"),
-            bind_group_layouts: &[Some(&bgl)],
-            immediate_size: 0,
+        let knot_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("knot"),
+            entries: &[
+                buffer_entry(0, wgpu::BufferBindingType::Uniform),
+                buffer_entry(1, wgpu::BufferBindingType::Storage { read_only: true }),
+            ],
         });
+        let knot_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("knot"),
+            layout: &knot_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: knot_uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: files.as_entire_binding() },
+            ],
+        });
+        let layout = |bgl: &wgpu::BindGroupLayout| {
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[Some(bgl)],
+                immediate_size: 0,
+            })
+        };
+        let (face_layout, knot_layout) = (layout(&bgl), layout(&knot_bgl));
 
-        let pipeline = |label, vs, fs, buffers: &[Option<wgpu::VertexBufferLayout>], blend, topology| {
+        let pipeline = |label,
+                        (module, layout): (&wgpu::ShaderModule, &wgpu::PipelineLayout),
+                        vs,
+                        fs,
+                        buffers: &[Option<wgpu::VertexBufferLayout>],
+                        blend,
+                        topology| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
-                layout: Some(&layout),
+                layout: Some(layout),
                 vertex: wgpu::VertexState {
-                    module: &module,
+                    module,
                     entry_point: Some(vs),
                     compilation_options: Default::default(),
                     buffers,
@@ -457,7 +679,7 @@ impl Renderer {
                 depth_stencil: None,
                 multisample: wgpu::MultisampleState::default(),
                 fragment: Some(wgpu::FragmentState {
-                    module: &module,
+                    module,
                     entry_point: Some(fs),
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
@@ -471,7 +693,10 @@ impl Renderer {
             })
         };
 
-        let ground = pipeline("ground", "ground_vs", "ground_fs", &[], None, wgpu::PrimitiveTopology::TriangleList);
+        let f = (&face, &face_layout);
+        let kn = (&knot_module, &knot_layout);
+        let strip = wgpu::PrimitiveTopology::TriangleStrip;
+        let ground = pipeline("ground", f, "ground_vs", "ground_fs", &[], None, wgpu::PrimitiveTopology::TriangleList);
         let attrs = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4];
         let shape_layout = wgpu::VertexBufferLayout {
             array_stride: size_of::<Shape>() as u64,
@@ -480,18 +705,53 @@ impl Renderer {
         };
         let shape = pipeline(
             "shapes",
+            f,
             "shape_vs",
             "shape_fs",
             &[Some(shape_layout)],
             Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-            wgpu::PrimitiveTopology::TriangleStrip,
+            strip,
         );
+        let knot_field = pipeline("knot field", kn, "field_vs", "field_fs", &[], Some(ADDITIVE), strip);
+        let dot_attrs = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4];
+        let dot_layout = wgpu::VertexBufferLayout {
+            array_stride: size_of::<knot::Particle>() as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &dot_attrs,
+        };
+        let knot_dots =
+            pipeline("knot dots", kn, "particle_vs", "particle_fs", &[Some(dot_layout)], Some(ADDITIVE), strip);
+        // Glyphs cover the knot; trails write zero alpha, so the same blend adds them.
+        let over = Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING);
+        let file_glyphs = pipeline("file glyphs", kn, "glyph_vs", "glyph_fs", &[], over, strip);
+        let file_trails = pipeline("file trails", kn, "trail_vs", "trail_fs", &[], over, strip);
 
-        Renderer { ground, shape, globals, shapes, bind, text: Text::new(device, queue, format), prepared: None, trimmed: true }
+        Renderer {
+            ground,
+            shape,
+            globals,
+            shapes,
+            bind,
+            knot_field,
+            knot_dots,
+            file_glyphs,
+            file_trails,
+            files,
+            files_gen: None,
+            knot_uniform,
+            knot_bind,
+            particles,
+            particle_count: dots.len() as u32,
+            text: Text::new(device, queue, format),
+            trimmed: true,
+            last_globals: None,
+            last_knot: None,
+            last_shapes: Vec::new(),
+        }
     }
 
-    /// Uploads globals and shapes and prepares text. Returns the shape count.
-    fn prepare(&mut self, gpu: &Gpu, (w, h): (u32, u32), scale: f64, view: View) -> u32 {
+    /// Uploads uniforms and shapes, and prepares text if it changed. Returns the shape count.
+    fn prepare(&mut self, gpu: &Gpu, (w, h): (u32, u32), scale: f64, scene: &Scene) -> u32 {
         let (device, queue) = (&gpu.device, &gpu.queue);
         let l = Layout::new(w, h, scale);
         let (wf, hf) = (w as f32, h as f32);
@@ -502,19 +762,49 @@ impl Renderer {
             vignette: VIGNETTE,
             _pad: [0.0; 2],
             ink: rgba(theme::INK, 1.0),
-            light: ground_light(),
+            light: ground_light(scene.knot.state[0]),
         };
-        queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
-        self.text.layout(&l, (w, h, scale.to_bits()));
-        let shapes = shapes(&l, view, self.text.strip_h);
-        queue.write_buffer(&self.shapes, 0, bytemuck::cast_slice(&shapes));
+        if self.last_globals.as_ref() != Some(&globals) {
+            queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
+            self.last_globals = Some(globals);
+        }
+        if self.last_knot.as_ref() != Some(&scene.knot) {
+            queue.write_buffer(&self.knot_uniform, 0, bytemuck::bytes_of(&scene.knot));
+            self.last_knot = Some(scene.knot);
+        }
+        if self.files_gen != Some(scene.files_gen) {
+            let n = scene.files.len().min(files::CAP);
+            if n > 0 {
+                queue.write_buffer(&self.files, 0, bytemuck::cast_slice(&scene.files[..n]));
+            }
+            self.files_gen = Some(scene.files_gen);
+        }
 
-        self.text.prepare(device, queue, w, h, view.palette);
-        shapes.len() as u32
+        let key = TextKey {
+            size: (w, h, scale.to_bits()),
+            crumbs: scene.crumbs.iter().map(|c| c.to_string()).collect(),
+            label: scene.label.map(str::to_string),
+            file_label: scene.file_label.map(|(p, [x, y])| (p.to_string(), x.round() as i32, y.round() as i32)),
+            more: scene.more.map(str::to_string),
+        };
+        self.text.layout(&l, key, scene.knot.radius());
+        let mut labels = Vec::with_capacity(2);
+        labels.extend(self.text.label.as_ref().map(|(_, b)| (*b, scene.label_alpha)));
+        labels.extend(self.text.file_label.as_ref().map(|(_, b)| (*b, scene.file_label_alpha)));
+        let shapes = shapes(&l, scene.view, self.text.strip_h, &labels);
+        if shapes != self.last_shapes {
+            queue.write_buffer(&self.shapes, 0, bytemuck::cast_slice(&shapes));
+        }
+
+        if self.text.prepare(device, queue, w, h, scene.view.palette, [scene.label_alpha, scene.file_label_alpha]) {
+            self.trimmed = false;
+        }
+        let n = shapes.len() as u32;
+        self.last_shapes = shapes;
+        n
     }
 
-    /// Records one frame. A frame that repeats the last one reuses its uploads and
-    /// prepared text.
+    /// Records one frame.
     pub fn draw(
         &mut self,
         gpu: &Gpu,
@@ -522,18 +812,9 @@ impl Renderer {
         target: &wgpu::TextureView,
         (w, h): (u32, u32),
         scale: f64,
-        view: View,
+        scene: &Scene,
     ) {
-        let key = (view, w, h, scale.to_bits());
-        let count = match self.prepared {
-            Some((v, pw, ph, ps, n)) if (v, pw, ph, ps) == key => n,
-            _ => {
-                let n = self.prepare(gpu, (w, h), scale, view);
-                self.prepared = Some((view, w, h, scale.to_bits(), n));
-                self.trimmed = false;
-                n
-            }
-        };
+        let count = self.prepare(gpu, (w, h), scale, scene);
 
         let [r, g, b] = theme::INK.srgb_f32();
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -555,6 +836,22 @@ impl Renderer {
         pass.set_bind_group(0, &self.bind, &[]);
         pass.set_pipeline(&self.ground);
         pass.draw(0..3, 0..1);
+
+        pass.set_bind_group(0, &self.knot_bind, &[]);
+        pass.set_pipeline(&self.knot_field);
+        pass.draw(0..4, 0..1);
+        pass.set_pipeline(&self.knot_dots);
+        pass.set_vertex_buffer(0, self.particles.slice(..));
+        pass.draw(0..4, 0..self.particle_count);
+        let glyphs = scene.files.len().min(files::CAP) as u32;
+        if glyphs > 0 {
+            pass.set_pipeline(&self.file_trails);
+            pass.draw(0..4, 0..glyphs);
+            pass.set_pipeline(&self.file_glyphs);
+            pass.draw(0..4, 0..glyphs);
+        }
+
+        pass.set_bind_group(0, &self.bind, &[]);
         pass.set_pipeline(&self.shape);
         pass.set_vertex_buffer(0, self.shapes.slice(..));
         pass.draw(0..4, 0..count);
@@ -563,8 +860,8 @@ impl Renderer {
         }
     }
 
-    /// Frees glyphs not used by the last prepared frame. A repeated frame skips this:
-    /// glyphs are marked used only when text is prepared.
+    /// Frees glyphs not used by the last text prepare. Frames that reuse prepared text skip
+    /// this: glyphs are marked used only when text is prepared.
     pub fn trim(&mut self) {
         if !self.trimmed {
             self.text.atlas.trim();

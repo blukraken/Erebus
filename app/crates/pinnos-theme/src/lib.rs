@@ -46,9 +46,14 @@ pub const BRASS: Rgb = Rgb::hex(0x8c7a58);
 pub const RULE: Rgb = Rgb::hex(0x3a3328);
 pub const RULE_2: Rgb = Rgb::hex(0x4d4436);
 
+// Knot: the system's own colour, neutral so agents stand out against it
+pub const PEARL: Rgb = Rgb::hex(0xdedbd3);
+pub const PEARL_HI: Rgb = Rgb::hex(0xf5f3ee);
+
 // Energy
 pub const EMBER: Rgb = Rgb::hex(0xffb04a);
 pub const HOT: Rgb = Rgb(255, 236, 200);
+pub const HOT_CORE: Rgb = Rgb(255, 250, 240);
 pub const FROST: Rgb = Rgb(168, 208, 232);
 pub const ICE: Rgb = Rgb(232, 246, 255);
 pub const LILAC: Rgb = Rgb::hex(0xb0a5dc);
@@ -69,8 +74,11 @@ pub const TOKENS: &[Token] = &[
     Token { name: "bone-3", role: "tertiary text", rgb: BONE_3 },
     Token { name: "bone-2", role: "secondary text", rgb: BONE_2 },
     Token { name: "bone", role: "primary text, worker braids", rgb: BONE },
-    Token { name: "ember", role: "Claude, context, active", rgb: EMBER },
+    Token { name: "pearl", role: "knot shell and trails", rgb: PEARL },
+    Token { name: "pearl-hi", role: "knot heads", rgb: PEARL_HI },
+    Token { name: "ember", role: "Claude, active", rgb: EMBER },
     Token { name: "hot", role: "nucleus core", rgb: HOT },
+    Token { name: "hot-core", role: "nucleus white point", rgb: HOT_CORE },
     Token { name: "frost", role: "Codex", rgb: FROST },
     Token { name: "ice", role: "Codex highlight", rgb: ICE },
     Token { name: "lilac", role: "memory, unknown relation", rgb: LILAC },

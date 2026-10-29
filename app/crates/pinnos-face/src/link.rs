@@ -6,7 +6,7 @@
 //! mismatch, or three missed heartbeats. Reconnects every second while down. Sends made
 //! while down are dropped.
 
-use pinnos_protocol::{read_frame, write_frame, CoreMsg, FaceMsg, HEARTBEAT_MS, MAX_FRAME, PIPE_NAME, PROTOCOL_VERSION};
+use pinnos_protocol::{read_frame, write_frame, Context, CoreMsg, FaceMsg, HEARTBEAT_MS, MAX_FRAME, PIPE_NAME, PROTOCOL_VERSION};
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -33,6 +33,8 @@ pub fn pipe_name() -> String {
 pub enum LinkEvent {
     Up,
     Down,
+    /// The core's current context; sent after `Up` and on every change.
+    Context(Box<Context>),
     Show,
     Exit,
 }
@@ -69,7 +71,7 @@ pub fn spawn(notify: impl Fn(LinkEvent) + Send + 'static) -> Result<Link, String
         match e {
             LinkEvent::Up => thread_up.store(true, Ordering::Release),
             LinkEvent::Down => thread_up.store(false, Ordering::Release),
-            LinkEvent::Show | LinkEvent::Exit => {}
+            LinkEvent::Show | LinkEvent::Exit | LinkEvent::Context(_) => {}
         }
         notify(e);
     };
@@ -165,6 +167,10 @@ fn session(mut pipe: Pipe, notify: &dyn Fn(LinkEvent), rx: &Receiver<FaceMsg>, w
                             }
                         }
                         Ok(CoreMsg::Heartbeat { .. }) => {}
+                        Ok(CoreMsg::Context(ctx)) if up => {
+                            log::info!("link: context {ctx:?}");
+                            notify(LinkEvent::Context(Box::new(ctx)));
+                        }
                         Ok(msg @ (CoreMsg::Show | CoreMsg::Exit)) if up => {
                             log::info!("link: got {msg:?}");
                             notify(if msg == CoreMsg::Show { LinkEvent::Show } else { LinkEvent::Exit });

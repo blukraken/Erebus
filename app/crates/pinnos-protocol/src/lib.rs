@@ -10,7 +10,10 @@ use std::io::{self, Read, Write};
 pub const PIPE_NAME: &str = r"\\.\pipe\pinnos-core";
 
 /// Bumped on any breaking change. Peers with different versions refuse each other.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 4;
+
+/// Most changed files listed in [`GitState::files`]; the rest only count toward `changed`.
+pub const MAX_CHANGED_FILES: usize = 64;
 
 /// Frames larger than this are rejected to bound memory on a corrupt stream.
 pub const MAX_FRAME: u32 = 4 * 1024 * 1024;
@@ -29,6 +32,59 @@ pub enum CoreMsg {
     Show,
     /// Exit the face process. The core keeps running.
     Exit,
+    /// The current context. Sent after `Hello` and again whenever any field changes.
+    Context(Context),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Context {
+    /// Active workspace name, e.g. "dev".
+    pub workspace: String,
+    /// All configured workspace names, in config order.
+    pub workspaces: Vec<String>,
+    /// Active project, if the workspace has one.
+    pub project: Option<Project>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Project {
+    pub name: String,
+    pub path: String,
+    /// `None` when the path is not a git repository or git is unavailable.
+    pub git: Option<GitState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GitState {
+    /// Branch name, or `None` on a detached HEAD.
+    pub branch: Option<String>,
+    /// Abbreviated HEAD commit, or `None` before the first commit.
+    pub head: Option<String>,
+    /// Files with staged, unstaged or untracked changes.
+    pub changed: u32,
+    /// Up to [`MAX_CHANGED_FILES`] of those files, sorted by path.
+    pub files: Vec<ChangedFile>,
+    /// Commits ahead of upstream, or `None` without an upstream.
+    pub ahead: Option<u32>,
+    pub behind: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangedFile {
+    /// Repo-relative path with forward slashes. For renames, the new path.
+    pub path: String,
+    pub status: FileStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileStatus {
+    Modified,
+    Added,
+    Deleted,
+    Renamed,
+    Untracked,
+    Conflicted,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -72,6 +128,33 @@ mod tests {
     #[test]
     fn frame_round_trip() {
         let msg = CoreMsg::Heartbeat { seq: 7, unix_ms: 42 };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &msg).unwrap();
+        let back: CoreMsg = read_frame(&mut buf.as_slice()).unwrap();
+        assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn context_round_trip() {
+        let msg = CoreMsg::Context(Context {
+            workspace: "dev".into(),
+            workspaces: vec!["dev".into(), "art".into()],
+            project: Some(Project {
+                name: "PinnOS".into(),
+                path: r"F:\Projects\PinnOS".into(),
+                git: Some(GitState {
+                    branch: Some("main".into()),
+                    head: Some("348c109".into()),
+                    changed: 2,
+                    files: vec![
+                        ChangedFile { path: "docs/components.md".into(), status: FileStatus::Modified },
+                        ChangedFile { path: "notes.txt".into(), status: FileStatus::Untracked },
+                    ],
+                    ahead: None,
+                    behind: None,
+                }),
+            }),
+        });
         let mut buf = Vec::new();
         write_frame(&mut buf, &msg).unwrap();
         let back: CoreMsg = read_frame(&mut buf.as_slice()).unwrap();

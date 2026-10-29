@@ -1,8 +1,11 @@
 //! PinnOS core: the always-on background service. Serves the named pipe the face connects to
-//! and owns the tray icon.
+//! and owns the tray icon and the context service.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod config;
+mod context;
+mod git;
 mod hub;
 mod icon;
 mod ids;
@@ -68,6 +71,7 @@ async fn run(name: &str) -> ExitCode {
         None
     };
     let (quit_tx, quit_rx) = oneshot::channel();
+    context::spawn(hub_tx.clone());
     hub::spawn(hub_rx, tray.as_ref().map(tray::Tray::hwnd), quit_tx);
 
     let mut serve = pin!(server::serve(first, name, server::now_ms(), hub_tx));

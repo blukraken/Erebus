@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 pinnos-protocol.workspace = true
 pinnos-theme.workspace = true
+serde_json.workspace = true
 winit = "0.30.13"
 wgpu = { version = "30.0.1", default-features = false, features = ["dx12", "vulkan", "wgsl"] }
 glyphon = "0.12.0"

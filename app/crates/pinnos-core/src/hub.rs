@@ -6,11 +6,12 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use pinnos_protocol::CoreMsg;
+use pinnos_protocol::{Context, CoreMsg};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 use tokio::time::{timeout_at, Instant};
 
+use crate::context::summary;
 use crate::log::{log_error, log_info, log_warn};
 use crate::route::{plan, Effect, TrayAction};
 use crate::tray;
@@ -33,6 +34,8 @@ pub enum Event {
     /// A client went away. Ignored for ids that never registered.
     Down(u64),
     Tray(TrayAction),
+    /// The context service's latest reading. Faces hear about it only when it differs.
+    Context(Context),
 }
 
 pub fn channel() -> (UnboundedSender<Event>, UnboundedReceiver<Event>) {
@@ -51,6 +54,7 @@ async fn run(
     mut shutdown: Option<oneshot::Sender<&'static str>>,
 ) {
     let mut faces: Vec<(u64, u32, UnboundedSender<Out>)> = Vec::new();
+    let mut current: Option<Context> = None;
     let publish = |n: usize| {
         if let Some(hwnd) = tray {
             tray::faces_changed(hwnd, n);
@@ -59,6 +63,9 @@ async fn run(
     while let Some(event) = rx.recv().await {
         match event {
             Event::Up(id, pid, tx) => {
+                if let Some(c) = &current {
+                    let _ = tx.send(Out { msg: CoreMsg::Context(c.clone()), done: None });
+                }
                 faces.push((id, pid, tx));
                 log_info!("face {id} registered; {} connected", faces.len());
                 publish(faces.len());
@@ -70,6 +77,16 @@ async fn run(
                     log_info!("face {id} gone; {} connected", faces.len());
                     publish(faces.len());
                 }
+            }
+            Event::Context(next) => {
+                if current.as_ref() == Some(&next) {
+                    continue;
+                }
+                log_info!("context: {}", summary(&next));
+                for (_, _, tx) in &faces {
+                    let _ = tx.send(Out { msg: CoreMsg::Context(next.clone()), done: None });
+                }
+                current = Some(next);
             }
             Event::Tray(action) => {
                 log_info!("tray action {action:?} with {} face(s)", faces.len());

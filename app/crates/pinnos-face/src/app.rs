@@ -1,6 +1,18 @@
-//! The window. Renders on demand only: resize, DPI change, `P`, a link change, a close
-//! button state change, while the bead fade runs, or in fullscreen while the cursor moves.
-//! With nothing changing, the loop sleeps in `ControlFlow::Wait`.
+//! The window. The knot animates whenever the window can be seen, paced by
+//! `ControlFlow::WaitUntil` per render state:
+//!
+//! | State | When | Frames |
+//! |---|---|---|
+//! | Suspended | hidden to tray, minimised, or covered by the foreground window | none |
+//! | Glance | visible, no input for [`GLANCE_AFTER`] | 30 fps cap, half the dots |
+//! | Calm | visible, recent input | 60 fps cap, full detail |
+//!
+//! Fullscreen also presents on every cursor move; see [`MOTION_FRAMES`]. With Windows
+//! animation effects off, the knot holds still and frames run only for a transition.
+//! Other changes (resize, DPI, `P`, link, close button) redraw on demand as before.
+//!
+//! The animation clock advances only when a frame is drawn, by the real time since the
+//! last one, capped at 100 ms. A state change never makes it jump.
 //!
 //! Suspend signals on Windows (winit 0.30.13, wgpu 30 on D3D12):
 //! - Minimise arrives as `Resized(0x0)` from `WM_SIZE`. Rendering stops until a non-zero size.
@@ -23,9 +35,10 @@
 //! log each request and frame; `--trace` logs them all, plus per-second input counts.
 
 use crate::gpu::Gpu;
+use crate::knot;
 use crate::link::{self, Link, LinkEvent};
-use crate::render::{self, Close, Renderer, View};
-use pinnos_protocol::FaceMsg;
+use crate::render::{self, Close, Renderer, Scene, View};
+use pinnos_protocol::{Context, FaceMsg, GitState};
 use pinnos_theme as theme;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -53,7 +66,28 @@ const TRACE_SECS: u64 = 3;
 /// treat the face as fullscreen and draw over it.
 const MOTION_FRAMES: Duration = Duration::from_millis(100);
 /// Redraw reasons that repeat every frame; traced as per-second counts, not lines.
-const STEADY: [&str; 2] = ["idle present", "cursor motion"];
+const STEADY: [&str; 3] = ["idle present", "cursor motion", "animate"];
+
+/// Calm turns to Glance after this long without input.
+const GLANCE_AFTER: Duration = Duration::from_secs(10);
+const CALM_FRAME: Duration = Duration::from_nanos(1_000_000_000 / 60);
+const GLANCE_FRAME: Duration = Duration::from_nanos(1_000_000_000 / 30);
+/// How often the cover and animation-setting checks run while the window is visible.
+const POLL: Duration = Duration::from_millis(500);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RenderState {
+    Suspended,
+    Glance,
+    Calm,
+}
+
+/// Frames drawn in the current render state, for the transition log.
+struct StateLog {
+    state: RenderState,
+    since: Instant,
+    frames: u64,
+}
 
 pub struct Options {
     /// Start in the F11 window instead of fullscreen.
@@ -64,6 +98,8 @@ pub struct Options {
     pub idle_present_hz: f64,
     /// Present nothing extra while the cursor moves in fullscreen.
     pub no_motion_frames: bool,
+    /// Hold the knot still as if Windows animation effects were off.
+    pub reduced_motion: bool,
 }
 
 #[derive(Debug)]
@@ -98,7 +134,11 @@ struct Activity {
     frames: u32,
     idle_frames: u32,
     motion_frames: u32,
+    anim_frames: u32,
     cursor_sets: u32,
+    /// Main-thread CPU at `since`, and wall time spent in `render`, microseconds.
+    cpu0: u64,
+    render_us: u64,
 }
 
 struct App {
@@ -137,6 +177,28 @@ struct App {
     /// Cursor position since it last entered the window, for telling motion from a
     /// window appearing under a still cursor.
     last_move: Option<PhysicalPosition<f64>>,
+    sim: knot::Sim,
+    /// The core's last context. Kept while the link is down, so a reconnect can flare.
+    context: Option<Context>,
+    /// Project path and git state the last flare compared against.
+    last_git: Option<(String, GitState)>,
+    /// Wordmark crumbs and knot label for the current state.
+    crumbs: Vec<String>,
+    label: Option<String>,
+    knot_hover: bool,
+    /// Path and glyph centre of the last hovered file; kept while its label fades.
+    file_label: Option<(String, [f32; 2])>,
+    /// Windows animation effects are off, or `--reduced-motion`.
+    reduced: bool,
+    /// The foreground window covers this one.
+    covered: bool,
+    next_poll: Instant,
+    last_input: Instant,
+    /// Start of the last drawn frame; paces the next.
+    last_frame: Instant,
+    /// When the animation clock last advanced.
+    last_sim: Instant,
+    state: StateLog,
 }
 
 pub fn run(opts: Options) -> Result<(), String> {
@@ -180,7 +242,23 @@ pub fn run(opts: Options) -> Result<(), String> {
         next_idle: now,
         motion_until: None,
         last_move: None,
+        sim: knot::Sim::default(),
+        context: None,
+        last_git: None,
+        crumbs: Vec::new(),
+        label: None,
+        knot_hover: false,
+        file_label: None,
+        reduced: false,
+        covered: false,
+        next_poll: now,
+        last_input: now,
+        last_frame: now,
+        last_sim: now,
+        state: StateLog { state: RenderState::Calm, since: now, frames: 0 },
     };
+    app.reduced = app.opts.reduced_motion || animations_off();
+    log::info!("reduced motion {}", if app.reduced { "on" } else { "off" });
     event_loop.run_app(&mut app).map_err(|e| e.to_string())?;
     match app.error {
         Some(e) => Err(e),
@@ -248,6 +326,92 @@ fn double_click() -> (Duration, f64, f64) {
     }
 }
 
+fn iconic(w: &Window) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::IsIconic;
+    // SAFETY: query on this process's own live window.
+    hwnd(w).is_some_and(|h| unsafe { IsIconic(h) } != 0)
+}
+
+/// CPU time of the calling thread, in microseconds.
+fn thread_cpu_us() -> u64 {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+    let z = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let (mut c, mut e, mut k, mut u) = (z, z, z, z);
+    // SAFETY: the pseudo handle needs no closing; the FILETIMEs are ours.
+    unsafe { GetThreadTimes(GetCurrentThread(), &mut c, &mut e, &mut k, &mut u) };
+    let t = |f: FILETIME| ((f.dwHighDateTime as u64) << 32 | f.dwLowDateTime as u64) / 10;
+    t(k) + t(u)
+}
+
+/// Windows "Animation effects" is off.
+fn animations_off() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETCLIENTAREAANIMATION};
+    let mut on: i32 = 1;
+    // SAFETY: the query writes one BOOL into `on`.
+    let ok = unsafe { SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, (&mut on as *mut i32).cast(), 0) };
+    ok != 0 && on == 0
+}
+
+/// The foreground window is another app's and fully contains this one, so nothing of the
+/// face can be seen: a fullscreen game, or a maximised window over the F11 window. The
+/// desktop and taskbar never count.
+fn covered(w: &Window) -> bool {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetClassNameW, GetForegroundWindow, GetWindowRect, IsIconic, IsWindowVisible,
+    };
+    let Some(h) = hwnd(w) else { return false };
+    // SAFETY: queries on live window handles into buffers owned here.
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.is_null() || fg == h || IsIconic(fg) != 0 || IsWindowVisible(fg) == 0 {
+            return false;
+        }
+        let mut class = [0u16; 32];
+        let n = GetClassNameW(fg, class.as_mut_ptr(), class.len() as i32);
+        let class = String::from_utf16_lossy(&class[..n.max(0) as usize]);
+        if matches!(class.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd") {
+            return false;
+        }
+        let mut a = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        let mut b = a;
+        GetWindowRect(fg, &mut a);
+        GetWindowRect(h, &mut b);
+        a.left <= b.left && a.top <= b.top && a.right >= b.right && a.bottom >= b.bottom
+    }
+}
+
+/// `main · 348c109 · 2 changed`, or why there is no such line.
+fn git_label(ctx: &Context) -> Option<String> {
+    let project = ctx.project.as_ref()?;
+    let Some(g) = &project.git else { return Some("no git".into()) };
+    let branch = g.branch.as_deref().unwrap_or("detached");
+    let head = g.head.as_deref().unwrap_or("no commits");
+    let changed = if g.changed == 0 { "clean".to_string() } else { format!("{} changed", g.changed) };
+    Some(format!("{branch} · {head} · {changed}"))
+}
+
+/// Wordmark crumbs and knot label for a context; none while the knot is dormant.
+pub fn context_text(ctx: Option<&Context>, live: bool) -> (Vec<String>, Option<String>) {
+    match ctx.filter(|_| live) {
+        Some(c) => {
+            let mut crumbs = vec![c.workspace.clone()];
+            crumbs.extend(c.project.as_ref().map(|p| p.name.clone()));
+            (crumbs, git_label(c))
+        }
+        None => (Vec::new(), None),
+    }
+}
+
+/// The listed files and full changed count of a context.
+pub fn context_files(ctx: Option<&Context>) -> (&[pinnos_protocol::ChangedFile], u32) {
+    match ctx.and_then(|c| c.project.as_ref()?.git.as_ref()) {
+        Some(g) => (&g.files, g.changed),
+        None => (&[], 0),
+    }
+}
+
 impl App {
     fn tracing(&self) -> bool {
         self.opts.trace || Instant::now() < self.trace_until
@@ -282,20 +446,154 @@ impl App {
         }
         let a = std::mem::take(&mut self.activity);
         log::info!(
-            "+{} ms activity over {} ms: {} moves, {} frames, {} idle frames, {} motion frames, {} cursor sets",
+            "+{} ms activity over {} ms: {} moves, {} frames, {} idle frames, {} motion frames, {} anim frames, {} cursor sets, {:?}, main thread CPU {} us, render {} us",
             self.ms(),
             dt.as_millis(),
             a.moves,
             a.frames,
             a.idle_frames,
             a.motion_frames,
-            a.cursor_sets
+            a.anim_frames,
+            a.cursor_sets,
+            self.state.state,
+            thread_cpu_us().saturating_sub(a.cpu0),
+            a.render_us,
         );
+    }
+
+    fn knot_live(&self) -> bool {
+        self.link_up && self.context.is_some()
+    }
+
+    /// Recomputes the knot's targets and words from link, context and hover.
+    fn refresh_knot(&mut self) {
+        let live = self.knot_live();
+        let (crumbs, label) = context_text(self.context.as_ref(), live);
+        self.crumbs = crumbs;
+        self.label = label;
+        self.sim.live_target = if live { 1.0 } else { 0.0 };
+        self.sim.hover_target = if self.knot_hover && self.label.is_some() { 1.0 } else { 0.0 };
+    }
+
+    fn set_context(&mut self, ctx: Context) {
+        let project = ctx.project.as_ref();
+        let git = project.and_then(|p| Some((p.path.clone(), p.git.clone()?)));
+        let seen = self.state.state != RenderState::Suspended;
+        let mut commit = None;
+        if let (Some((old_path, old)), Some((path, new))) = (&self.last_git, &git) {
+            // A switch to another project is not a git change, so it does not flare.
+            if old_path == path {
+                if let Some(f) = knot::flare_for(old, new) {
+                    if seen {
+                        self.sim.flare(f);
+                    }
+                    log::info!("context: {f:?} change{}", if seen { "; flare" } else { " while suspended; no flare" });
+                }
+                // A new head on the same branch is a commit: files that left it dash home.
+                if old.branch == new.branch && old.head != new.head {
+                    commit = new.head.clone();
+                }
+            }
+        }
+        self.last_git = git;
+        self.context = Some(ctx);
+        self.refresh_knot();
+
+        let dash = seen && !self.reduced;
+        let (list, changed) = context_files(self.context.as_ref());
+        let c = self.sim.set_files(list, changed, commit.as_deref(), dash);
+        log::info!(
+            "files: {} listed of {changed}; {} new, {} dash, {} fade{}",
+            list.len(),
+            c.added,
+            c.dashed,
+            c.faded,
+            c.first_arrival.map_or(String::new(), |t| format!("; first arrival in {:.0} ms", t * 1000.0)),
+        );
+        if let Some([x, y]) = self.sim.files.first().and_then(|i| self.glyph_screen(i)) {
+            log::info!("files: first glyph at {}, {}", x.round(), y.round());
+        }
+        if !seen {
+            self.sim.snap();
+        }
+        self.redraw("context");
+    }
+
+    fn render_state(&self, now: Instant) -> RenderState {
+        if self.hidden || self.minimized || self.covered || self.live.is_none() {
+            RenderState::Suspended
+        } else if now.duration_since(self.last_input) >= GLANCE_AFTER {
+            RenderState::Glance
+        } else {
+            RenderState::Calm
+        }
+    }
+
+    /// Moves to the render state that applies now, and logs the frames the last one drew.
+    fn update_state(&mut self, now: Instant) {
+        let next = self.render_state(now);
+        let prev = self.state.state;
+        if next == prev {
+            return;
+        }
+        let secs = now.duration_since(self.state.since).as_secs_f64();
+        let frames = self.state.frames;
+        log::info!(
+            "render state {prev:?} -> {next:?} after {secs:.1} s: {frames} frames ({:.1} fps)",
+            frames as f64 / secs.max(1e-3)
+        );
+        self.state = StateLog { state: next, since: now, frames: 0 };
+        self.sim.lod_target = if next == RenderState::Glance { 0.0 } else { 1.0 };
+        if prev == RenderState::Suspended {
+            // Missed events do not replay: the knot resumes at the current state.
+            self.sim.snap();
+            self.last_sim = now;
+            self.redraw("resumed");
+        }
+    }
+
+    fn input(&mut self) {
+        self.last_input = Instant::now();
+    }
+
+    /// Where glyph `i` is drawn now, in client pixels.
+    fn glyph_screen(&self, i: usize) -> Option<[f32; 2]> {
+        let live = self.live.as_ref()?;
+        let (w, h) = (live.config.width, live.config.height);
+        let r = knot::radius(w, h, live.window.scale_factor());
+        Some(self.sim.files.screen(i, [w as f32 * 0.5, h as f32 * 0.5], r, self.sim.rot()))
+    }
+
+    /// The listed file glyph under the cursor, if the knot is live.
+    fn file_hit(&self, p: PhysicalPosition<f64>) -> Option<(usize, String)> {
+        let live = self.live.as_ref().filter(|_| self.knot_live())?;
+        let (w, h) = (live.config.width, live.config.height);
+        let r = knot::radius(w, h, live.window.scale_factor());
+        let centre = [w as f32 * 0.5, h as f32 * 0.5];
+        let (i, path) = self.sim.files.hit([p.x as f32, p.y as f32], centre, r, self.sim.rot(), r * 0.06)?;
+        Some((i, path.to_string()))
+    }
+
+    /// Animation frames are due: the knot moves, or a transition runs.
+    fn animating(&self) -> bool {
+        self.state.state != RenderState::Suspended && (!self.reduced || self.sim.busy())
+    }
+
+    /// Hover hit on the knot: inside 0.9 of its radius, as in the prototype.
+    fn knot_hit(&self, p: PhysicalPosition<f64>) -> bool {
+        let Some(live) = &self.live else { return false };
+        let (w, h) = (live.config.width, live.config.height);
+        let r = knot::radius(w, h, live.window.scale_factor()) as f64 * 0.9;
+        let (dx, dy) = (p.x - w as f64 * 0.5, p.y - h as f64 * 0.5);
+        dx * dx + dy * dy < r * r
     }
 
     fn count(&mut self, f: impl FnOnce(&mut Activity)) {
         if self.opts.trace {
-            self.activity.since.get_or_insert_with(Instant::now);
+            if self.activity.since.is_none() {
+                self.activity.since = Some(Instant::now());
+                self.activity.cpu0 = thread_cpu_us();
+            }
             f(&mut self.activity);
         }
     }
@@ -439,6 +737,31 @@ impl App {
         // Windows also sends a move when a window appears under a still cursor; only a
         // change from a known position counts as motion.
         let moved = self.last_move.replace(p).is_some_and(|q| q != p);
+        if moved {
+            self.input();
+        }
+        let over_file = self.file_hit(p);
+        if over_file.as_ref().map(|f| f.0) != self.sim.hovered {
+            self.sim.hovered = over_file.as_ref().map(|f| f.0);
+            if let Some((i, path)) = over_file {
+                log::info!("file hover in: {path}");
+                self.file_label = self.glyph_screen(i).map(|at| (path, at));
+            } else {
+                log::info!("file hover out");
+            }
+            if self.sim.busy() && self.pending.is_none() {
+                self.redraw("file hover");
+            }
+        }
+        let over_knot = self.knot_hit(p);
+        if over_knot != self.knot_hover {
+            self.knot_hover = over_knot;
+            self.refresh_knot();
+            log::info!("knot hover {}, label {:?}", if over_knot { "in" } else { "out" }, self.label);
+            if self.sim.busy() && self.pending.is_none() {
+                self.redraw("knot hover");
+            }
+        }
         let fullscreen = self.live.as_ref().is_some_and(|l| l.window.fullscreen().is_some());
         if moved && fullscreen && !self.opts.no_motion_frames {
             self.motion_until = Some(Instant::now() + MOTION_FRAMES);
@@ -465,6 +788,7 @@ impl App {
     }
 
     fn left_button(&mut self, event_loop: &ActiveEventLoop, state: ElementState) {
+        self.input();
         // The last move position stands in for the press position; winit reports none.
         let Some(p) = self.cursor else { return };
         let hit = self.hit(p);
@@ -520,7 +844,14 @@ impl App {
     fn render(&mut self) {
         let why = self.pending.take().unwrap_or("system paint");
         let fading = self.tick();
+        let now = Instant::now();
+        let t0 = now;
+        self.update_state(now);
+        let dt = now.duration_since(self.last_sim).as_secs_f32();
+        self.last_sim = now;
+        self.sim.step(dt, self.reduced);
         let view = View { palette: self.palette, link: smoothstep(self.link_t), close: self.close };
+        let more = if self.knot_live() { self.sim.files.more() } else { None };
         let Some(live) = &mut self.live else { return };
         if self.hidden || self.minimized || live.config.width == 0 || live.config.height == 0 {
             return;
@@ -559,27 +890,39 @@ impl App {
 
         let target = frame.texture.create_view(&Default::default());
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
-        renderer.draw(
-            gpu,
-            &mut encoder,
-            &target,
-            (config.width, config.height),
-            window.scale_factor(),
+        let (w, h, scale) = (config.width, config.height, window.scale_factor());
+        let crumbs: Vec<&str> = self.crumbs.iter().map(String::as_str).collect();
+        let scene = Scene {
             view,
-        );
+            knot: self.sim.uniform(w, h, scale, self.reduced),
+            crumbs: &crumbs,
+            label: self.label.as_deref(),
+            label_alpha: self.sim.hover(),
+            files: self.sim.files.instances(),
+            files_gen: self.sim.files.generation,
+            file_label: self.file_label.as_ref().map(|(p, at)| (p.as_str(), *at)),
+            file_label_alpha: self.sim.file_hover(),
+            more: more.as_deref(),
+        };
+        renderer.draw(gpu, &mut encoder, &target, (w, h), scale, &scene);
         gpu.queue.submit([encoder.finish()]);
         window.pre_present_notify();
         gpu.queue.present(frame);
         renderer.trim();
         let size = (config.width, config.height);
 
+        let spent = t0.elapsed().as_micros() as u64;
+        self.count(|a| a.render_us += spent);
         self.frames += 1;
+        self.state.frames += 1;
+        self.last_frame = now;
         if self.tracing() && !STEADY.contains(&why) {
             log::info!("+{} ms frame {}: {why}, {}x{}", self.ms(), self.frames, size.0, size.1);
         }
         match why {
             "idle present" => self.count(|a| a.idle_frames += 1),
             "cursor motion" => self.count(|a| a.motion_frames += 1),
+            "animate" => self.count(|a| a.anim_frames += 1),
             _ => self.count(|a| a.frames += 1),
         }
         if let Some(every) = self.idle_every {
@@ -600,7 +943,8 @@ impl App {
     fn resize(&mut self) {
         let Some(live) = &self.live else { return };
         let size = live.window.inner_size();
-        let minimized = size.width == 0 || size.height == 0;
+        // A borderless window minimises to a 160x28 parked frame, not 0x0.
+        let minimized = size.width == 0 || size.height == 0 || iconic(&live.window);
         let resumed = !minimized && self.minimized;
         if minimized != self.minimized {
             log::info!(
@@ -720,13 +1064,16 @@ impl ApplicationHandler<UiEvent> for App {
                 if up != self.link_up {
                     self.link_up = up;
                     self.last_tick = Instant::now();
+                    self.refresh_knot();
                     if self.minimized || self.hidden {
                         // No animation while unseen: snap to the new state.
                         self.link_t = if up { 1.0 } else { 0.0 };
+                        self.sim.snap();
                     }
                     self.redraw("link change");
                 }
             }
+            LinkEvent::Context(ctx) => self.set_context(*ctx),
             LinkEvent::Show => self.show(),
             LinkEvent::Exit => {
                 log::info!("exit requested by core");
@@ -767,7 +1114,9 @@ impl ApplicationHandler<UiEvent> for App {
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => self.left_button(event_loop, state),
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
+            WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. } => self.input(),
             WindowEvent::KeyboardInput { event, .. } => {
+                self.input();
                 if event.state != ElementState::Pressed || event.repeat {
                     return;
                 }
@@ -792,14 +1141,51 @@ impl ApplicationHandler<UiEvent> for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.flush_activity(false);
+        let now = Instant::now();
         let mut wake = self.activity.since.map(|s| s + Duration::from_secs(1));
-        if let Some(every) = self.idle_every.filter(|_| !self.hidden && !self.minimized) {
-            let now = Instant::now();
+        let mut at = |t: Instant| wake = Some(wake.map_or(t, |w: Instant| w.min(t)));
+
+        // Cover and animation-setting checks, only while the window could be seen.
+        let shown = !self.hidden && !self.minimized;
+        if shown && now >= self.next_poll {
+            self.next_poll = now + POLL;
+            let covered = self.live.as_ref().is_some_and(|l| covered(&l.window));
+            if covered != self.covered {
+                log::info!("{}", if covered { "covered by the foreground window" } else { "uncovered" });
+                self.covered = covered;
+            }
+            let reduced = self.opts.reduced_motion || animations_off();
+            if reduced != self.reduced {
+                log::info!("reduced motion {}", if reduced { "on" } else { "off" });
+                self.reduced = reduced;
+            }
+        }
+        self.update_state(now);
+
+        if self.animating() {
+            let every = if self.state.state == RenderState::Glance { GLANCE_FRAME } else { CALM_FRAME };
+            let next = self.last_frame + every;
+            if now >= next {
+                if self.pending.is_none() {
+                    self.redraw("animate");
+                }
+            } else {
+                at(next);
+            }
+        }
+        if shown {
+            at(self.next_poll);
+        }
+        if self.state.state == RenderState::Calm {
+            at(self.last_input + GLANCE_AFTER);
+        }
+
+        if let Some(every) = self.idle_every.filter(|_| shown) {
             if now >= self.next_idle && self.pending.is_none() {
                 self.redraw("idle present");
                 self.next_idle = now + every;
             }
-            wake = Some(wake.map_or(self.next_idle, |w| w.min(self.next_idle)));
+            at(self.next_idle);
         }
         event_loop.set_control_flow(wake.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
     }
