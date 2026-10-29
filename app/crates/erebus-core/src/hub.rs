@@ -7,7 +7,9 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use erebus_protocol::{Context, CoreMsg, Hardware, Sample, Vitals, VITALS_HISTORY};
+use erebus_protocol::{
+    Context, CoreMsg, FeedEvent, Hardware, Sample, SessionInfo, Vitals, FEED_HISTORY, VITALS_HISTORY,
+};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 use tokio::time::{timeout_at, Instant};
@@ -41,6 +43,10 @@ pub enum Event {
     Hardware(Hardware),
     /// One second of vitals.
     Vitals(Sample),
+    /// Every live session. Faces hear about it only when it differs.
+    Sessions(Vec<SessionInfo>),
+    /// New feed events, oldest first.
+    Feed(Vec<FeedEvent>),
 }
 
 pub fn channel() -> (UnboundedSender<Event>, UnboundedReceiver<Event>) {
@@ -62,6 +68,8 @@ async fn run(
     let mut current: Option<Context> = None;
     let mut hw: Option<Hardware> = None;
     let mut ring: VecDeque<Sample> = VecDeque::with_capacity(VITALS_HISTORY);
+    let mut sessions: Option<Vec<SessionInfo>> = None;
+    let mut feed: VecDeque<FeedEvent> = VecDeque::with_capacity(FEED_HISTORY);
     let publish = |n: usize| {
         if let Some(hwnd) = tray {
             tray::faces_changed(hwnd, n);
@@ -76,6 +84,13 @@ async fn run(
                 if let Some(hw) = &hw {
                     let samples = ring.iter().cloned().collect();
                     let _ = tx.send(Out { msg: CoreMsg::Vitals(Vitals { hw: hw.clone(), samples }), done: None });
+                }
+                if let Some(s) = &sessions {
+                    let _ = tx.send(Out { msg: CoreMsg::Sessions { sessions: s.clone() }, done: None });
+                }
+                if !feed.is_empty() {
+                    let events = feed.iter().cloned().collect();
+                    let _ = tx.send(Out { msg: CoreMsg::Feed { events }, done: None });
                 }
                 faces.push((id, pid, tx));
                 log_info!("face {id} registered; {} connected", faces.len());
@@ -114,6 +129,26 @@ async fn run(
                         let msg = CoreMsg::Vitals(Vitals { hw: hw.clone(), samples: vec![sample.clone()] });
                         let _ = tx.send(Out { msg, done: None });
                     }
+                }
+            }
+            Event::Sessions(next) => {
+                if sessions.as_ref() == Some(&next) {
+                    continue;
+                }
+                for (_, _, tx) in &faces {
+                    let _ = tx.send(Out { msg: CoreMsg::Sessions { sessions: next.clone() }, done: None });
+                }
+                sessions = Some(next);
+            }
+            Event::Feed(events) => {
+                for e in &events {
+                    if feed.len() == FEED_HISTORY {
+                        feed.pop_front();
+                    }
+                    feed.push_back(e.clone());
+                }
+                for (_, _, tx) in &faces {
+                    let _ = tx.send(Out { msg: CoreMsg::Feed { events: events.clone() }, done: None });
                 }
             }
             Event::Tray(action) => {

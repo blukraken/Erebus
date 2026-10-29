@@ -2,6 +2,7 @@
 //! or with `--frames` a numbered sequence for video.
 
 use crate::app::{context_files, context_text};
+use crate::feed::Feed;
 use crate::gpu::Gpu;
 use crate::knot::{self, Flare, Sim};
 use crate::panel::{self, Panel};
@@ -57,8 +58,11 @@ pub struct KnotShot {
     pub hover_vital: Option<vitals::Row>,
     /// Opens the vitals panel on this row: fully open in a still, unfolding in a sequence.
     pub vitals_panel: Option<vitals::Row>,
-    /// A sequence closes the panel this many seconds in.
-    pub vitals_panel_close: Option<f64>,
+    /// Feed events: a still shows them settled; a sequence holds back the last three and
+    /// delivers them 0.8 s apart.
+    pub feed: Option<Vec<erebus_protocol::FeedEvent>>,
+    /// Scrolls the feed back this many rows and lets the wheel rest, so the live chip shows.
+    pub feed_scroll: Option<f32>,
 }
 
 /// How far into a `--flare` the still is taken.
@@ -236,12 +240,24 @@ pub fn run(shot: &Shot) -> Result<(), String> {
         vpanel.toggle(row);
     }
     let panel_frame = |p: &Panel, vt: &Vitals| panel::frame(p, vt, column.as_ref()?, (w, h), false, k.reduced);
+    let mut feed = Feed::new();
+    let mut held: Vec<erebus_protocol::FeedEvent> = k.feed.clone().unwrap_or_default();
+    let hold = if shot.frames.is_some() { held.len().min(3) } else { 0 };
+    feed.ingest(held.drain(..held.len() - hold).collect());
+    if let Some(rows) = k.feed_scroll {
+        feed.scroll_by(rows);
+        for _ in 0..60 {
+            feed.step(1.0 / 60.0, k.reduced);
+        }
+    }
+    let feed_frame = |f: &Feed| f.frame(column.as_ref()?, k.reduced);
 
     let mut renderer = Renderer::new(&gpu.device, &gpu.queue, format);
     let Some(frames) = &shot.frames else {
         vpanel.snap();
         let vf = vt.frame(column.as_ref(), now_ms, (w, h), k.reduced);
         let pf = panel_frame(&vpanel, &vt);
+        let ff = feed_frame(&feed);
         let more = if live { sim.files.more() } else { None };
         let file_label = file_label(&sim, k, centre, r);
         let scene = Scene {
@@ -257,6 +273,7 @@ pub fn run(shot: &Shot) -> Result<(), String> {
             more: more.as_deref(),
             vitals: vf.as_ref(),
             panel: pf.as_ref(),
+            feed: ff.as_ref(),
         };
         if k.bench > 0 {
             bench(&gpu, &mut renderer, &target.view, (w, h), &scene, &sim, k, &vt, now_ms);
@@ -278,10 +295,12 @@ pub fn run(shot: &Shot) -> Result<(), String> {
             now_ms = vitals::CANNED_T0 + 400 + ((k.time + f64::from(i) * dt) * 1000.0) as u64;
             feed_canned(&mut vt, now_ms);
             vt.step(dt as f32, k.reduced);
-            if k.vitals_panel_close.is_some_and(|at| f64::from(i) * dt >= at) {
-                vpanel.close();
-            }
             vpanel.step(dt as f32, k.reduced);
+            feed.step(dt as f32, k.reduced);
+        }
+        let due = (f64::from(i) * dt / 0.8).floor() as usize;
+        if !held.is_empty() && hold - held.len() < due {
+            feed.ingest(vec![held.remove(0)]);
         }
         if pending.is_some_and(|at| f64::from(i) * dt >= at) {
             pending = None;
@@ -290,6 +309,7 @@ pub fn run(shot: &Shot) -> Result<(), String> {
         let more = if live { sim.files.more() } else { None };
         let vf = vt.frame(column.as_ref(), now_ms, (w, h), k.reduced);
         let pf = panel_frame(&vpanel, &vt);
+        let ff = feed_frame(&feed);
         let scene = Scene {
             view: shot.view,
             knot: sim.uniform(w, h, 1.0, k.reduced),
@@ -303,6 +323,7 @@ pub fn run(shot: &Shot) -> Result<(), String> {
             more: more.as_deref(),
             vitals: vf.as_ref(),
             panel: pf.as_ref(),
+            feed: ff.as_ref(),
         };
         let rgb = target.capture(&gpu, &mut renderer, &scene, crop)?;
         write_png(&frames.dir.join(format!("frame_{i:05}.png")), out_size, &zoom(rgb, cw, shot.zoom))?;

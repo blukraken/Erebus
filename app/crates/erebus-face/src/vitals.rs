@@ -103,6 +103,9 @@ pub struct Column {
     pub u: f32,
     /// Band top and bottom: the space between the top rail and the bottom bar.
     pub band: [f32; 2],
+    /// The live feed below the rows `[x, y, w, h]`, and the column's left padding.
+    pub feed: [f32; 4],
+    pub pad_l: f32,
     pub rows: [RowBox; ROWS],
 }
 
@@ -154,7 +157,8 @@ pub fn column(w: u32, h: u32, scale: f64) -> Option<Column> {
         y += row_h[i] + gap;
         b
     });
-    Some(Column { px: s, k: kf * s, right: feed_w * s, u: u * s, band: [y0 * s, y1 * s], rows })
+    let feed = [0.0, (y1 - feed_h) * s, feed_w * s, feed_h * s];
+    Some(Column { px: s, k: kf * s, right: feed_w * s, u: u * s, band: [y0 * s, y1 * s], feed, pad_l: pad_l * s, rows })
 }
 
 /// Readings as drawn: eased toward the newest sample.

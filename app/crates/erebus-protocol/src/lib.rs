@@ -10,7 +10,7 @@ use std::io::{self, Read, Write};
 pub const PIPE_NAME: &str = r"\\.\pipe\erebus-core";
 
 /// Bumped on any breaking change. Peers with different versions refuse each other.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Most changed files listed in [`GitState::files`]; the rest only count toward `changed`.
 pub const MAX_CHANGED_FILES: usize = 64;
@@ -24,6 +24,12 @@ pub const HEARTBEAT_MS: u64 = 1000;
 
 /// Vitals samples the core keeps and replays to a face on connect. One sample per second.
 pub const VITALS_HISTORY: usize = 90;
+
+/// Feed events the core keeps and replays to a face on connect.
+pub const FEED_HISTORY: usize = 32;
+
+/// Longest [`FeedEvent::phrase`], in characters.
+pub const MAX_PHRASE: usize = 40;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
@@ -40,6 +46,96 @@ pub enum CoreMsg {
     /// System vitals. Sent after `Hello` with up to [`VITALS_HISTORY`] samples, then once a
     /// second with the newest sample only.
     Vitals(Vitals),
+    /// Every live agent session on the machine. Sent after `Hello` and again whenever any
+    /// session starts, ends or changes.
+    Sessions { sessions: Vec<SessionInfo> },
+    /// Session events, oldest first. Sent after `Hello` with up to [`FEED_HISTORY`] events,
+    /// then as they happen.
+    Feed { events: Vec<FeedEvent> },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInfo {
+    /// The harness's own session id.
+    pub id: String,
+    /// Short name the feed uses, e.g. "erebus" or "erebus-2".
+    pub label: String,
+    /// Working folder the session runs in.
+    pub cwd: String,
+    /// "claude" for Claude Code.
+    pub harness: String,
+    pub status: SessionStatus,
+    pub started_unix_ms: u64,
+    /// Workers the session spawned and still runs.
+    pub workers: Vec<WorkerInfo>,
+    /// A permission prompt waiting on the person, after a short settle.
+    pub pending: Option<Pending>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStatus {
+    Busy,
+    Idle,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerInfo {
+    /// The harness's agent id.
+    pub id: String,
+    /// Short name in spawn order, e.g. "w1".
+    pub label: String,
+    /// Agent type, e.g. "Explore".
+    pub kind: String,
+    pub started_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pending {
+    pub tool_use_id: String,
+    /// Tool name, e.g. "Bash".
+    pub tool: String,
+    /// The worker that asked, or `None` for the session itself.
+    pub worker: Option<String>,
+    pub since_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeedEvent {
+    pub unix_ms: u64,
+    pub kind: FeedKind,
+    /// `<who> · <what>`, at most [`MAX_PHRASE`] characters; never a full command or file
+    /// contents.
+    pub phrase: String,
+    pub session: String,
+    /// The worker it came from, or `None` for the session itself.
+    pub worker: Option<String>,
+    /// Read from history when the core first saw the session; drawn without motion.
+    pub backlog: bool,
+}
+
+/// What a feed line reports; each kind has its own colour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedKind {
+    /// A session started or ended.
+    Session,
+    /// A worker was spawned.
+    Spawn,
+    /// A tool call started.
+    Tool,
+    /// A tool call returned.
+    Result,
+    /// A tool call failed or a turn was interrupted.
+    Error,
+    /// A permission was granted or denied.
+    Perm,
+    /// The context was compacted.
+    Compact,
+    /// A skill was invoked.
+    Skill,
+    /// A turn ended: idle when no worker or background task still runs.
+    Turn,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -233,6 +329,34 @@ mod tests {
         write_frame(&mut buf, &msg).unwrap();
         let back: CoreMsg = read_frame(&mut buf.as_slice()).unwrap();
         assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn sessions_and_feed_round_trip() {
+        let session = SessionInfo {
+            id: "aabbb6cd".into(),
+            label: "erebus".into(),
+            cwd: r"F:\Projects\Erebus".into(),
+            harness: "claude".into(),
+            status: SessionStatus::Busy,
+            started_unix_ms: 1_000,
+            workers: vec![WorkerInfo { id: "a2f6".into(), label: "w1".into(), kind: "Explore".into(), started_unix_ms: 2_000 }],
+            pending: Some(Pending { tool_use_id: "toolu_1".into(), tool: "Bash".into(), worker: None, since_unix_ms: 3_000 }),
+        };
+        let event = FeedEvent {
+            unix_ms: 4_000,
+            kind: FeedKind::Tool,
+            phrase: "erebus · Bash cargo".into(),
+            session: "aabbb6cd".into(),
+            worker: None,
+            backlog: false,
+        };
+        for msg in [CoreMsg::Sessions { sessions: vec![session] }, CoreMsg::Feed { events: vec![event] }] {
+            let mut buf = Vec::new();
+            write_frame(&mut buf, &msg).unwrap();
+            let back: CoreMsg = read_frame(&mut buf.as_slice()).unwrap();
+            assert_eq!(back, msg);
+        }
     }
 
     #[test]

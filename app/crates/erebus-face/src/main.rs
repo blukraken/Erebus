@@ -23,8 +23,10 @@
 //!
 //! Stills and sequences show the vitals from a canned history; `--no-vitals` leaves them out
 //! and `--hover-vital ram|gpu|cpu` shows that row's tooltip. `--vitals-panel ram|gpu|cpu`
-//! shows the vitals panel open on that row; a frame sequence plays it being built, and
-//! `--vitals-panel-close <s>` has the sequence close it that many seconds in.
+//! shows the vitals panel open on that row; a frame sequence plays it being built.
+//! `--feed <json>` fills the live feed from a JSON array of protocol `FeedEvent`, or
+//! `--feed canned` from a built-in set; a sequence delivers the last three live.
+//! `--feed-scroll <rows>` scrolls it back that far, showing the live chip.
 //!
 //! `--frames <dir> [--duration <s>] [--fps <n>]` replaces the still with a consecutive
 //! sequence, `dir/frame_00000.png` onward, stepping the clock 1/fps per frame from `--time`.
@@ -32,6 +34,7 @@
 //! `--commit-at` fires the commit that many seconds into the sequence.
 
 mod app;
+mod feed;
 mod files;
 mod gpu;
 mod instance;
@@ -52,7 +55,7 @@ const USAGE: &str = "usage: erebus-face [--windowed] [--trace] [--idle-present <
                      [--close-hover|--close-press] [--windowed-chrome] [--context <json>] [--time <s>] \
                      [--hover-knot] [--flare branch|head|changed] [--glance] [--reduced-motion] [--bench <n>] \
                      [--files <json>] [--commit-at <s>] [--commit-count <n>] [--hover-file <path>] \
-                     [--crop WxH[+X+Y]] [--zoom <n>] [--no-vitals] [--hover-vital ram|gpu|cpu] \n                     [--vitals-panel ram|gpu|cpu] [--vitals-panel-close <s>] \
+                     [--crop WxH[+X+Y]] [--zoom <n>] [--no-vitals] [--hover-vital ram|gpu|cpu] \n                     [--vitals-panel ram|gpu|cpu] [--feed <json>|canned] [--feed-scroll <rows>] \
                      | --frames <dir> [--duration <s>] [--fps <n>] [screenshot options]";
 
 fn parse_size(flag: &str, v: &str) -> Result<(u32, u32), String> {
@@ -161,7 +164,16 @@ fn parse(args: &[String]) -> Result<Mode, String> {
                 let v = value()?;
                 knot.vitals_panel = Some(vitals::Row::parse(v).ok_or(format!("bad --vitals-panel {v}"))?);
             }
-            "--vitals-panel-close" => knot.vitals_panel_close = Some(parse_secs(a, value()?, 0.0..=600.0)?),
+            "--feed" => {
+                let v = value()?;
+                knot.feed = Some(if v == "canned" {
+                    feed::canned()
+                } else {
+                    let text = std::fs::read_to_string(v.as_str()).map_err(|e| format!("--feed {v}: {e}"))?;
+                    serde_json::from_str(&text).map_err(|e| format!("--feed {v}: {e}"))?
+                });
+            }
+            "--feed-scroll" => knot.feed_scroll = Some(parse_secs(a, value()?, 0.0..=1000.0)? as f32),
             "--palette" => view.palette = true,
             "--link" => {
                 view.link = match value()?.as_str() {

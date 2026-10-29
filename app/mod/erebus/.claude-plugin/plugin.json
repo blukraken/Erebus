@@ -1,0 +1,5 @@
+{
+  "name": "erebus",
+  "version": "0.1.0",
+  "description": "Tells the Erebus desktop app when a permission prompt waits on you."
+}

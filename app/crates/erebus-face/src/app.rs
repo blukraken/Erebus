@@ -38,6 +38,7 @@
 //! Every redraw request carries a reason. The first seconds after start or an F11 toggle
 //! log each request and frame; `--trace` logs them all, plus per-second input counts.
 
+use crate::feed::{self, Feed};
 use crate::gpu::Gpu;
 use crate::knot;
 use crate::link::{self, Link, LinkEvent};
@@ -126,6 +127,8 @@ enum Hit {
     /// The open vitals panel, and its "— collapse" control.
     Panel,
     Collapse,
+    /// The live feed: a row, the live chip, or the ground between rows.
+    Feed(feed::Spot),
 }
 
 struct Live {
@@ -213,6 +216,7 @@ struct App {
     vitals: Vitals,
     panel: Panel,
     collapse_hover: bool,
+    feed: Feed,
 }
 
 pub fn run(opts: Options) -> Result<(), String> {
@@ -273,6 +277,7 @@ pub fn run(opts: Options) -> Result<(), String> {
         vitals: Vitals::default(),
         panel: Panel::default(),
         collapse_hover: false,
+        feed: Feed::new(),
     };
     app.reduced = app.opts.reduced_motion || animations_off();
     log::info!("reduced motion {}", if app.reduced { "on" } else { "off" });
@@ -570,6 +575,7 @@ impl App {
             self.sim.snap();
             self.vitals.snap();
             self.panel.snap();
+            self.feed.snap();
             self.last_sim = now;
             self.redraw("resumed");
         }
@@ -599,7 +605,7 @@ impl App {
 
     /// Animation frames are due: the knot moves, or a transition runs.
     fn animating(&self) -> bool {
-        self.state.state != RenderState::Suspended && (!self.reduced || self.sim.busy() || self.panel.busy())
+        self.state.state != RenderState::Suspended && (!self.reduced || self.sim.busy() || self.panel.busy() || self.feed.busy())
     }
 
     /// Hover hit on the knot: inside 0.9 of its radius, as in the prototype.
@@ -753,7 +759,27 @@ impl App {
                 return Hit::Panel;
             }
         }
+        if let Some(spot) = self.feed.hit(&col, x, y) {
+            return Hit::Feed(spot);
+        }
         col.hit(x, y).map_or(Hit::None, Hit::Vital)
+    }
+
+    /// Scrolls the feed when the cursor is over it: a notch is one row, a touchpad moves by
+    /// pixels.
+    fn wheel(&mut self, delta: winit::event::MouseScrollDelta) {
+        let Some(p) = self.cursor else { return };
+        if !matches!(self.hit(p), Hit::Feed(_)) {
+            return;
+        }
+        let Some(live) = &self.live else { return };
+        let Some(col) = vitals::column(live.config.width, live.config.height, live.window.scale_factor()) else { return };
+        let rows = match delta {
+            winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+            winit::event::MouseScrollDelta::PixelDelta(d) => d.y as f32 / feed::layout(&col).pitch,
+        };
+        self.feed.scroll_by(rows);
+        self.redraw("feed scroll");
     }
 
     /// Opens, moves or closes the vitals panel. A window that is not animating starts at once.
@@ -831,6 +857,13 @@ impl App {
         }
         self.cursor = Some(p);
         let hit = self.hit(p);
+        let row = if let Hit::Feed(feed::Spot::Row(id)) = hit { Some(id) } else { None };
+        let chip = hit == Hit::Feed(feed::Spot::Chip);
+        if row != self.feed.hover || chip != self.feed.chip_hover {
+            self.feed.hover = row;
+            self.feed.chip_hover = chip;
+            self.redraw("feed hover");
+        }
         let tip = if let Hit::Vital(r) = hit { (!self.panel.is_open()).then_some(r) } else { None };
         self.set_vital_hover(tip);
         if (hit == Hit::Collapse) != self.collapse_hover {
@@ -845,7 +878,7 @@ impl App {
         });
         let icon = match hit {
             Hit::Edge(d) => resize_cursor(d),
-            Hit::Vital(_) | Hit::Collapse => CursorIcon::Pointer,
+            Hit::Vital(_) | Hit::Collapse | Hit::Feed(feed::Spot::Chip) => CursorIcon::Pointer,
             _ => CursorIcon::Default,
         };
         if icon != self.cursor_icon {
@@ -912,7 +945,12 @@ impl App {
             }
             Hit::Vital(row) => self.panel_change(|p| p.toggle(row)),
             Hit::Collapse => self.panel_change(Panel::close),
-            Hit::Panel | Hit::None => {}
+            Hit::Feed(feed::Spot::Chip) => {
+                log::info!("feed: back to live");
+                self.feed.go_live();
+                self.redraw("feed live");
+            }
+            Hit::Panel | Hit::Feed(_) | Hit::None => {}
         }
     }
 
@@ -927,6 +965,7 @@ impl App {
         self.sim.step(dt, self.reduced);
         self.vitals.step(dt, self.reduced);
         self.panel.step(dt, self.reduced);
+        self.feed.step(dt, self.reduced);
         let view = View { palette: self.palette, link: smoothstep(self.link_t), close: self.close };
         let more = if self.knot_live() { self.sim.files.more() } else { None };
         let Some(live) = &mut self.live else { return };
@@ -972,6 +1011,7 @@ impl App {
         let column = vitals::column(w, h, scale);
         let vitals = self.vitals.frame(column.as_ref(), unix_ms(), (w, h), self.reduced);
         let panel = column.as_ref().and_then(|c| panel::frame(&self.panel, &self.vitals, c, (w, h), self.collapse_hover, self.reduced));
+        let feed = column.as_ref().and_then(|c| self.feed.frame(c, self.reduced));
         let scene = Scene {
             view,
             knot: self.sim.uniform(w, h, scale, self.reduced),
@@ -985,6 +1025,7 @@ impl App {
             more: more.as_deref(),
             vitals: vitals.as_ref(),
             panel: panel.as_ref(),
+            feed: feed.as_ref(),
         };
         renderer.draw(gpu, &mut encoder, &target, (w, h), scale, &scene);
         gpu.queue.submit([encoder.finish()]);
@@ -1146,6 +1187,7 @@ impl ApplicationHandler<UiEvent> for App {
                 if !up {
                     self.vitals.clear();
                     self.panel = Panel::default();
+                    self.feed.clear();
                 }
                 if up != self.link_up {
                     self.link_up = up;
@@ -1170,6 +1212,16 @@ impl ApplicationHandler<UiEvent> for App {
                 // Animating frames pick the sample up; Suspended keeps it for later.
                 if self.state.state != RenderState::Suspended && !self.animating() {
                     self.redraw("vitals");
+                }
+            }
+            LinkEvent::Sessions(sessions) => {
+                let workers: usize = sessions.iter().map(|s| s.workers.len()).sum();
+                log::info!("sessions: {} live, {workers} workers", sessions.len());
+            }
+            LinkEvent::Feed(events) => {
+                self.feed.ingest(events);
+                if self.state.state != RenderState::Suspended && !self.animating() {
+                    self.redraw("feed");
                 }
             }
             LinkEvent::Show => self.show(),
@@ -1213,7 +1265,11 @@ impl ApplicationHandler<UiEvent> for App {
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => self.left_button(event_loop, state),
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
-            WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. } => self.input(),
+            WindowEvent::MouseWheel { delta, .. } => {
+                self.input();
+                self.wheel(delta);
+            }
+            WindowEvent::MouseInput { .. } => self.input(),
             WindowEvent::KeyboardInput { event, .. } => {
                 self.input();
                 if event.state != ElementState::Pressed || event.repeat {

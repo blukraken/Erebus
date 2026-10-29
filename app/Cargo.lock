@@ -422,6 +422,7 @@ dependencies = [
  "erebus-theme",
  "notify",
  "serde",
+ "serde_json",
  "tokio",
  "toml",
  "windows-sys 0.61.2",

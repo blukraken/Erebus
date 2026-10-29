@@ -153,7 +153,13 @@ fn close_fs(in: ShapeOut) -> vec4f {
 @fragment
 fn shape_fs(in: ShapeOut) -> @location(0) vec4f {
     if in.params.x < 0.5 {
-        return vec4f(in.color.rgb * in.color.a, in.color.a);
+        // params.y = 1 fades the rect out to the right, falling with the square; params.z its width.
+        var a = in.color.a;
+        if in.params.y > 0.5 {
+            let t = clamp(in.local.x / in.params.z + 0.5, 0.0, 1.0);
+            a *= (1.0 - t) * (1.0 - t);
+        }
+        return vec4f(in.color.rgb * a, a);
     }
     if in.params.x > 1.5 {
         return close_fs(in);

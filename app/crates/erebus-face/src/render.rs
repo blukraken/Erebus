@@ -13,6 +13,7 @@ use glyphon::{
     Attrs, Buffer, Cache, Color, ColorMode, Family, FontSystem, Metrics, Resolution, Shaping,
     SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight, Wrap,
 };
+use crate::feed;
 use crate::files::{self, FileInst};
 use crate::gpu::Gpu;
 use crate::knot;
@@ -65,6 +66,8 @@ pub struct Scene<'a> {
     pub vitals: Option<&'a vitals::Frame>,
     /// The vitals panel, while any of it shows.
     pub panel: Option<&'a panel::Frame>,
+    /// The live feed, while it has rows.
+    pub feed: Option<&'a feed::Frame>,
 }
 
 /// Window chrome in physical pixels, shared by drawing and hit testing.
@@ -86,7 +89,7 @@ pub fn chrome(w: u32, h: u32, scale: f64) -> Chrome {
 
 /// Darkening at the far corners.
 const VIGNETTE: f32 = 0.14;
-const MAX_SHAPES: usize = 96;
+const MAX_SHAPES: usize = 128;
 const KIND_RECT: f32 = 0.0;
 const KIND_BEAD: f32 = 1.0;
 const KIND_CLOSE: f32 = 2.0;
@@ -191,9 +194,14 @@ impl Layout {
     }
 }
 
+/// A rect at opacity `a` at its left edge, fading to nothing at its right.
+fn fade_rect(x: f32, y: f32, w: f32, h: f32, c: Rgb, a: f32) -> Shape {
+    Shape { rect: [x, y, w, h], color: rgba(c, a), color2: [0.0; 4], params: [KIND_RECT, 1.0, w, 0.0] }
+}
+
+/// A rect at opacity `a`; the shader premultiplies.
 fn rgba_rect(x: f32, y: f32, w: f32, h: f32, c: Rgb, a: f32) -> Shape {
-    let [r, g, b] = c.srgb_f32();
-    Shape { rect: [x, y, w, h], color: [r * a, g * a, b * a, a], color2: [0.0; 4], params: [KIND_RECT, 0.0, 0.0, 0.0] }
+    Shape { rect: [x, y, w, h], color: rgba(c, a), color2: [0.0; 4], params: [KIND_RECT, 0.0, 0.0, 0.0] }
 }
 
 /// `labels` are hover label boxes `[x, y, w, h]` and their fades. `extra` comes first: the
@@ -306,6 +314,9 @@ struct Prepared {
     key: TextKey,
     vitals: Option<vitals::TextFrame>,
     panel: Option<panel::Text>,
+    /// Feed rows by id, with their tops and fades; the live chip's words, tint and fade.
+    feed: Vec<(u64, i32, u8)>,
+    chip: Option<(String, u8, u8)>,
 }
 
 struct Text {
@@ -325,6 +336,12 @@ struct Text {
     /// Panel words and what they were laid out from.
     panel_key: Option<panel::Text>,
     panel: Vec<Placed>,
+    /// Feed rows: id, clock and phrase, shaped once per row and moved each frame; the type
+    /// scale and text width they were shaped for.
+    feed: Vec<(u64, Placed, Placed, f32)>,
+    feed_shape: (u32, u32),
+    /// The live chip's words, as shaped, and their fade.
+    feed_chip: Option<(String, Placed, f32)>,
     /// Palette strip height, sized to its text.
     strip_h: f32,
     wordmark: Option<Placed>,
@@ -406,6 +423,9 @@ impl Text {
             vitals_tip: None,
             panel_key: None,
             panel: Vec::new(),
+            feed: Vec::new(),
+            feed_shape: (0, 0),
+            feed_chip: None,
             strip_h: 0.0,
             wordmark: None,
             label: None,
@@ -575,6 +595,68 @@ impl Text {
         self.vitals_key = Some((text.clone(), k.to_bits()));
     }
 
+    /// Shapes new feed rows and places every row where the frame has it. A phrase too wide for
+    /// the column is cut with an ellipsis. Prototype `.fr`: mono 13px, the clock 12.5px.
+    fn layout_feed(&mut self, frame: Option<&feed::Frame>) {
+        let Some(f) = frame else {
+            self.feed.clear();
+            self.feed_chip = None;
+            return;
+        };
+        let l = &f.layout;
+        let shape = (l.k.to_bits(), l.text_w().to_bits());
+        let mut old: Vec<(u64, Placed, Placed, f32)> = if shape == self.feed_shape { std::mem::take(&mut self.feed) } else { Vec::new() };
+        self.feed_shape = shape;
+        let fonts = &mut self.fonts;
+        let max_w = l.text_w();
+        self.feed = f
+            .rows
+            .iter()
+            .map(|r| {
+                let (mut clock, mut phrase) = match old.iter().position(|o| o.0 == r.id) {
+                    Some(i) => {
+                        let (_, c, p, _) = old.swap_remove(i);
+                        (c, p)
+                    }
+                    None => {
+                        let c = line(fonts, &r.clock, feed::TIME_SIZE * l.k, self.mono, Weight::NORMAL, 0.02, None);
+                        let mut text = r.phrase.clone();
+                        let mut p = line(fonts, &text, feed::PHRASE_SIZE * l.k, self.mono, Weight::NORMAL, 0.0, None);
+                        let w = p.layout_runs().map(|run| run.line_w).fold(0.0, f32::max);
+                        if w > max_w && !text.is_empty() {
+                            let n = text.chars().count();
+                            let keep = ((n as f32 * max_w / w).floor() as usize).saturating_sub(1).max(1);
+                            text = text.chars().take(keep).collect::<String>() + "…";
+                            p = line(fonts, &text, feed::PHRASE_SIZE * l.k, self.mono, Weight::NORMAL, 0.0, None);
+                        }
+                        let placed = |buf| Placed { buf, left: 0.0, top: 0.0, color: theme::BONE, bounds: bounds(0.0, 0.0, 0.0, 0.0) };
+                        (Placed { color: feed::CLOCK, ..placed(c) }, placed(p))
+                    }
+                };
+                // Text past the feed's top or bottom edge is cut there.
+                let [_, y, _, h] = l.rect;
+                for (p, top) in [(&mut clock, r.clock_top(l)), (&mut phrase, r.phrase_top(l))] {
+                    p.left = l.text_x;
+                    p.top = top;
+                    p.bounds = bounds(l.text_x, top.max(y), l.text_x + max_w + 1.0, (top + height(&p.buf)).min(y + h));
+                }
+                (r.id, clock, phrase, r.alpha)
+            })
+            .collect();
+        self.feed_chip = f.chip.as_ref().map(|c| {
+            let [cx, cy, cw, ch] = l.chip();
+            let color = if c.hover { theme::BONE } else { theme::BONE_2 };
+            let buf = match self.feed_chip.take() {
+                Some((t, p, _)) if t == c.text => p.buf,
+                _ => line(fonts, &c.text, feed::CHIP_SIZE * l.k, self.mono, Weight::NORMAL, 0.02, None),
+            };
+            let w = buf.layout_runs().map(|run| run.line_w).fold(0.0, f32::max);
+            let (left, top) = ((cx + (cw - w) * 0.5).round(), (cy + (ch - height(&buf)) * 0.5).round());
+            let b = bounds(left, top, left + w + 1.0, top + height(&buf));
+            (c.text.clone(), Placed { buf, left, top, color, bounds: b }, c.alpha)
+        });
+    }
+
     /// Lays out the panel's words when they change. Prototype `.vp-body`: mono 11.5px; the
     /// panel id is UI 600 12px.
     fn layout_panel(&mut self, text: Option<&panel::Text>) {
@@ -632,6 +714,8 @@ impl Text {
             key,
             vitals: self.vitals_key.as_ref().map(|(t, _)| t.clone()),
             panel: self.panel_key.clone(),
+            feed: self.feed.iter().map(|(id, c, _, a)| (*id, c.top as i32, byte(*a))).collect(),
+            chip: self.feed_chip.as_ref().map(|(t, p, a)| (t.clone(), p.color.0, byte(*a))),
         };
         if self.prepared.as_ref() == Some(&state) {
             return false;
@@ -648,6 +732,13 @@ impl Text {
         areas.extend(self.more.iter().map(Placed::area));
         areas.extend(self.vitals_rows.iter().map(Placed::area));
         areas.extend(self.vitals_tip.iter().map(|(p, _)| p.area()));
+        for (_, clock, phrase, a) in &self.feed {
+            areas.push(clock.area_alpha(*a));
+            areas.push(phrase.area_alpha(*a));
+        }
+        if let Some((_, p, a)) = &self.feed_chip {
+            areas.push(p.area_alpha(*a));
+        }
         if panel_fade > 0 {
             areas.extend(self.panel.iter().map(|p| {
                 let mut a = p.area_alpha(fades[2]);
@@ -943,7 +1034,12 @@ impl Renderer {
         self.text.layout(&l, key, scene.knot.radius());
         self.text.layout_vitals(l.k, scene.vitals.map(|v| &v.text));
         self.text.layout_panel(scene.panel.map(|p| &p.text));
-        let mut extra = Vec::with_capacity(24);
+        self.text.layout_feed(scene.feed);
+        let mut extra = Vec::with_capacity(48);
+        if let Some(f) = scene.feed {
+            extra.extend(f.washes.iter().map(|&([x, y, w, h], c, a)| fade_rect(x, y, w, h, c, a)));
+            extra.extend(f.rects.iter().filter(|r| r.2 > 0.0).map(|&([x, y, w, h], c, a)| rgba_rect(x, y, w, h, c, a)));
+        }
         if let Some(v) = scene.vitals {
             self.vitals.prepare(queue, v);
             // Left rules at .9, as the prototype's `--fc`.

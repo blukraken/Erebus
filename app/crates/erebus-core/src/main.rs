@@ -1,5 +1,5 @@
 //! Erebus core: the always-on background service. Serves the named pipe the face connects to
-//! and owns the tray icon, the context service and the vitals sampler.
+//! and owns the tray icon, the context service, the vitals sampler and the sessions service.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -12,6 +12,7 @@ mod ids;
 mod log;
 mod route;
 mod server;
+mod sessions;
 mod sysmon;
 mod tray;
 
@@ -74,6 +75,7 @@ async fn run(name: &str) -> ExitCode {
     let (quit_tx, quit_rx) = oneshot::channel();
     context::spawn(hub_tx.clone());
     sysmon::spawn(hub_tx.clone());
+    sessions::spawn(hub_tx.clone());
     hub::spawn(hub_rx, tray.as_ref().map(tray::Tray::hwnd), quit_tx);
 
     let mut serve = pin!(server::serve(first, name, server::now_ms(), hub_tx));
