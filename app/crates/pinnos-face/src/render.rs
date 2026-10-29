@@ -16,6 +16,7 @@ use glyphon::{
 use crate::files::{self, FileInst};
 use crate::gpu::Gpu;
 use crate::knot;
+use crate::vitals;
 use pinnos_theme::{self as theme, Rgb};
 use wgpu::util::DeviceExt;
 
@@ -59,6 +60,8 @@ pub struct Scene<'a> {
     pub file_label_alpha: f32,
     /// `+N` for files the core counts but does not list.
     pub more: Option<&'a str>,
+    /// The vitals stack, when there are readings.
+    pub vitals: Option<&'a vitals::Frame>,
 }
 
 /// Window chrome in physical pixels, shared by drawing and hit testing.
@@ -80,7 +83,7 @@ pub fn chrome(w: u32, h: u32, scale: f64) -> Chrome {
 
 /// Darkening at the far corners.
 const VIGNETTE: f32 = 0.14;
-const MAX_SHAPES: usize = 64;
+const MAX_SHAPES: usize = 96;
 const KIND_RECT: f32 = 0.0;
 const KIND_BEAD: f32 = 1.0;
 const KIND_CLOSE: f32 = 2.0;
@@ -190,9 +193,11 @@ fn rgba_rect(x: f32, y: f32, w: f32, h: f32, c: Rgb, a: f32) -> Shape {
     Shape { rect: [x, y, w, h], color: [r * a, g * a, b * a, a], color2: [0.0; 4], params: [KIND_RECT, 0.0, 0.0, 0.0] }
 }
 
-/// `labels` are hover label boxes `[x, y, w, h]` and their fades.
-fn shapes(l: &Layout, view: View, strip_h: f32, labels: &[([f32; 4], f32)]) -> Vec<Shape> {
+/// `labels` are hover label boxes `[x, y, w, h]` and their fades. `extra` comes first: the
+/// vitals rules and tooltip box.
+fn shapes(l: &Layout, view: View, strip_h: f32, labels: &[([f32; 4], f32)], extra: &[Shape]) -> Vec<Shape> {
     let mut out = Vec::with_capacity(MAX_SHAPES);
+    out.extend_from_slice(extra);
 
     // Hover label boxes: ink with a rule hairline, as the prototype's hovered `.lbl`.
     for &([x, y, w, h], a) in labels.iter().filter(|(_, a)| *a > 0.0) {
@@ -297,8 +302,12 @@ struct Text {
     renderer: TextRenderer,
     mono: &'static str,
     key: Option<TextKey>,
-    /// Palette, label fades (in 1/255 steps) and layout of the last prepare.
-    prepared: Option<(bool, u8, u8, TextKey)>,
+    /// Palette, label fades (in 1/255 steps) and layouts of the last prepare.
+    prepared: Option<(bool, u8, u8, TextKey, Option<vitals::TextFrame>)>,
+    /// Vitals rows and tooltip, and the text and type scale they were laid out for.
+    vitals_key: Option<(vitals::TextFrame, u32)>,
+    vitals_rows: Vec<Placed>,
+    vitals_tip: Option<(Placed, [f32; 4])>,
     /// Palette strip height, sized to its text.
     strip_h: f32,
     wordmark: Option<Placed>,
@@ -375,6 +384,9 @@ impl Text {
             mono,
             key: None,
             prepared: None,
+            vitals_key: None,
+            vitals_rows: Vec::new(),
+            vitals_tip: None,
             strip_h: 0.0,
             wordmark: None,
             label: None,
@@ -498,13 +510,60 @@ impl Text {
         }
     }
 
+    /// Lays out the vitals rows and tooltip when their words change. Prototype `.vl`: mono
+    /// 13px, the label in weight 500 with .1em tracking and at least 36px wide, 9px gaps.
+    /// Tooltip `#vtTip`: mono 12.5px, line height 1.45, padding 6px by 10px.
+    fn layout_vitals(&mut self, k: f32, text: Option<&vitals::TextFrame>) {
+        let Some(text) = text else {
+            self.vitals_key = None;
+            self.vitals_rows.clear();
+            self.vitals_tip = None;
+            return;
+        };
+        if self.vitals_key.as_ref().is_some_and(|(t, kb)| t == text && *kb == k.to_bits()) {
+            return;
+        }
+        let fonts = &mut self.fonts;
+        self.vitals_rows.clear();
+        for row in &text.rows {
+            let mut x = row.left;
+            for (i, (words, color)) in row.spans.iter().enumerate() {
+                let (weight, tracking) = if i == 0 { (Weight::MEDIUM, 0.1) } else { (Weight::NORMAL, 0.0) };
+                let buf = line(fonts, words, 13.0 * k, self.mono, weight, tracking, None);
+                let w = buf.layout_runs().map(|r| r.line_w).fold(0.0, f32::max);
+                let (left, top) = (x.round(), row.top.round());
+                let b = bounds(left, top, left + w + 1.0, top + height(&buf));
+                self.vitals_rows.push(Placed { buf, left, top, color: *color, bounds: b });
+                x += if i == 0 { w.max(36.0 * k) } else { w } + 9.0 * k;
+            }
+        }
+        self.vitals_tip = text.tip.as_ref().map(|tip| {
+            let size = 12.5 * k;
+            let mut buf = Buffer::new(fonts, Metrics::new(size, (size * 1.45).round()));
+            buf.set_wrap(Wrap::None);
+            buf.set_size(None, None);
+            let attrs = Attrs::new().family(Family::Name(self.mono));
+            buf.set_text(&tip.lines.join("\n"), &attrs, Shaping::Advanced, None);
+            buf.shape_until_scroll(fonts, false);
+            let w = buf.layout_runs().map(|r| r.line_w).fold(0.0, f32::max);
+            let (px, py) = (10.0 * k, 6.0 * k);
+            let (bx, by) = (tip.left.round(), tip.top.round());
+            let (bw, bh) = ((w + 2.0 * px).round(), (height(&buf) + 2.0 * py).round());
+            let (left, top) = (bx + px, by + py);
+            let b = bounds(left, top, left + w + 1.0, top + height(&buf));
+            (Placed { buf, left, top, color: theme::BONE, bounds: b }, [bx, by, bw, bh])
+        });
+        self.vitals_key = Some((text.clone(), k.to_bits()));
+    }
+
     /// Prepares text when anything shown changed. Returns whether it did. `fades` are the
     /// knot label's and the file label's.
     fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, w: u32, h: u32, palette: bool, fades: [f32; 2]) -> bool {
         let byte = |a: f32| (a.clamp(0.0, 1.0) * 255.0).round() as u8;
         let (fade, file_fade) = (byte(fades[0]), byte(fades[1]));
         let Some(key) = self.key.clone() else { return false };
-        let state = (palette, fade, file_fade, key);
+        let vitals = self.vitals_key.as_ref().map(|(t, _)| t.clone());
+        let state = (palette, fade, file_fade, key, vitals);
         if self.prepared.as_ref() == Some(&state) {
             return false;
         }
@@ -518,6 +577,8 @@ impl Text {
             areas.push(p.area_alpha(fades[1]));
         }
         areas.extend(self.more.iter().map(Placed::area));
+        areas.extend(self.vitals_rows.iter().map(Placed::area));
+        areas.extend(self.vitals_tip.iter().map(|(p, _)| p.area()));
         if palette {
             areas.extend(self.cells.iter().map(Placed::area));
         }
@@ -553,6 +614,10 @@ pub struct Renderer {
     knot_bind: wgpu::BindGroup,
     particles: wgpu::Buffer,
     particle_count: u32,
+    vitals: vitals::Painter,
+    /// With timestamps on, a frame splits into three passes, before, during and after the
+    /// vitals, each timed; see [`Renderer::time_passes`].
+    timing: Option<Timing>,
     text: Text,
     /// The atlas was trimmed after the last text prepare.
     trimmed: bool,
@@ -586,6 +651,16 @@ fn uniform_buffer(device: &wgpu::Device, label: &str, size: usize) -> wgpu::Buff
         mapped_at_creation: false,
     })
 }
+
+/// Pass timestamps: the query set and where they resolve.
+struct Timing {
+    queries: wgpu::QuerySet,
+    resolve: wgpu::Buffer,
+    readback: wgpu::Buffer,
+}
+
+/// Passes a timed frame splits into.
+const TIMED_PASSES: u32 = 3;
 
 /// Adds light: each knot layer sums onto what is below, as the prototype's `lighter` does.
 const ADDITIVE: wgpu::BlendState = wgpu::BlendState {
@@ -742,6 +817,8 @@ impl Renderer {
             knot_bind,
             particles,
             particle_count: dots.len() as u32,
+            vitals: vitals::Painter::new(device, format, ADDITIVE),
+            timing: None,
             text: Text::new(device, queue, format),
             trimmed: true,
             last_globals: None,
@@ -788,10 +865,21 @@ impl Renderer {
             more: scene.more.map(str::to_string),
         };
         self.text.layout(&l, key, scene.knot.radius());
+        self.text.layout_vitals(l.k, scene.vitals.map(|v| &v.text));
+        let mut extra = Vec::with_capacity(5);
+        if let Some(v) = scene.vitals {
+            self.vitals.prepare(queue, v);
+            // Left rules at .9, as the prototype's `--fc`.
+            extra.extend(v.rules.iter().map(|&([x, y, w, h], c)| rgba_rect(x, y, w, h, c, 0.9)));
+            if let Some((_, [x, y, w, h])) = self.text.vitals_tip {
+                extra.push(rect(x, y, w, h, theme::RULE_2));
+                extra.push(rect(x + l.hair, y + l.hair, w - 2.0 * l.hair, h - 2.0 * l.hair, vitals::TIP_GROUND));
+            }
+        }
         let mut labels = Vec::with_capacity(2);
         labels.extend(self.text.label.as_ref().map(|(_, b)| (*b, scene.label_alpha)));
         labels.extend(self.text.file_label.as_ref().map(|(_, b)| (*b, scene.file_label_alpha)));
-        let shapes = shapes(&l, scene.view, self.text.strip_h, &labels);
+        let shapes = shapes(&l, scene.view, self.text.strip_h, &labels, &extra);
         if shapes != self.last_shapes {
             queue.write_buffer(&self.shapes, 0, bytemuck::cast_slice(&shapes));
         }
@@ -817,22 +905,30 @@ impl Renderer {
         let count = self.prepare(gpu, (w, h), scale, scene);
 
         let [r, g, b] = theme::INK.srgb_f32();
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("face"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: target,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color { r: r as f64, g: g as f64, b: b as f64, a: 1.0 }),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
+        let clear = wgpu::LoadOp::Clear(wgpu::Color { r: r as f64, g: g as f64, b: b as f64, a: 1.0 });
+        let timing = self.timing.as_ref();
+        let begin = |encoder: &mut wgpu::CommandEncoder, load, i: u32| {
+            encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("face"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: target,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: timing.map(|t| wgpu::RenderPassTimestampWrites {
+                        query_set: &t.queries,
+                        beginning_of_pass_write_index: Some(2 * i),
+                        end_of_pass_write_index: Some(2 * i + 1),
+                    }),
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                })
+                .forget_lifetime()
+        };
+        let mut pass = begin(encoder, clear, 0);
         pass.set_bind_group(0, &self.bind, &[]);
         pass.set_pipeline(&self.ground);
         pass.draw(0..3, 0..1);
@@ -851,6 +947,18 @@ impl Renderer {
             pass.draw(0..4, 0..glyphs);
         }
 
+        if timing.is_some() {
+            drop(pass);
+            pass = begin(encoder, wgpu::LoadOp::Load, 1);
+        }
+        if let Some(v) = scene.vitals {
+            self.vitals.draw(&mut pass, v);
+        }
+        if timing.is_some() {
+            drop(pass);
+            pass = begin(encoder, wgpu::LoadOp::Load, 2);
+        }
+
         pass.set_bind_group(0, &self.bind, &[]);
         pass.set_pipeline(&self.shape);
         pass.set_vertex_buffer(0, self.shapes.slice(..));
@@ -858,6 +966,56 @@ impl Renderer {
         if let Err(e) = self.text.renderer.render(&self.text.atlas, &self.text.viewport, &mut pass) {
             log::error!("text render: {e}");
         }
+        drop(pass);
+        if let Some(t) = timing {
+            encoder.resolve_query_set(&t.queries, 0..2 * TIMED_PASSES, &t.resolve, 0);
+            encoder.copy_buffer_to_buffer(&t.resolve, 0, &t.readback, 0, t.resolve.size());
+        }
+    }
+
+    /// Times each frame's passes from now on: before, during and after the vitals. Needs
+    /// `TIMESTAMP_QUERY`; returns false without it.
+    pub fn time_passes(&mut self, device: &wgpu::Device) -> bool {
+        if !device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+            return false;
+        }
+        let n = 2 * TIMED_PASSES;
+        let queries = device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("pass times"),
+            ty: wgpu::QueryType::Timestamp,
+            count: n,
+        });
+        let size = 8 * n as u64;
+        let resolve = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pass times"),
+            size,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pass times readback"),
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        self.timing = Some(Timing { queries, resolve, readback });
+        true
+    }
+
+    /// GPU milliseconds of the last submitted frame's passes: before, during and after the
+    /// vitals. Waits for the GPU.
+    pub fn pass_times(&self, gpu: &Gpu) -> Option<[f64; TIMED_PASSES as usize]> {
+        let t = self.timing.as_ref()?;
+        let slice = t.readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        gpu.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
+        let ticks: Vec<u64> = {
+            let data = slice.get_mapped_range().ok()?;
+            data.as_chunks::<8>().0.iter().map(|b| u64::from_le_bytes(*b)).collect()
+        };
+        t.readback.unmap();
+        let period = f64::from(gpu.queue.get_timestamp_period()) / 1e6;
+        Some([0, 1, 2].map(|i| ticks[2 * i + 1].saturating_sub(ticks[2 * i]) as f64 * period))
     }
 
     /// Frees glyphs not used by the last text prepare. Frames that reuse prepared text skip

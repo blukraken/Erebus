@@ -17,7 +17,12 @@
 //! with a JSON array of protocol `ChangedFile`. `--commit-at <s>` shows the still that many
 //! seconds after a commit of the first `--commit-count <n>` files (all by default).
 //! `--hover-file <path>` hovers that file's glyph. `--bench <n>` first renders n frames
-//! offscreen and prints the CPU each costs. `--crop WxH` keeps only that centred region.
+//! offscreen and prints the CPU each costs, then the GPU time of each pass where the
+//! adapter has timestamps. `--crop WxH[+X+Y]` keeps only that region, centred unless placed;
+//! `--zoom <n>` scales the output up n times.
+//!
+//! Stills and sequences show the vitals from a canned history; `--no-vitals` leaves them out
+//! and `--hover-vital ram|gpu|cpu` shows that row's tooltip.
 //!
 //! `--frames <dir> [--duration <s>] [--fps <n>]` replaces the still with a consecutive
 //! sequence, `dir/frame_00000.png` onward, stepping the clock 1/fps per frame from `--time`.
@@ -33,6 +38,7 @@ mod link;
 mod logfile;
 mod render;
 mod shot;
+mod vitals;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -42,13 +48,28 @@ const USAGE: &str = "usage: pinnos-face [--windowed] [--trace] [--idle-present <
                      | --screenshot <png> [--size WxH] [--palette] [--link up|down] \
                      [--close-hover|--close-press] [--windowed-chrome] [--context <json>] [--time <s>] \
                      [--hover-knot] [--flare branch|head|changed] [--glance] [--reduced-motion] [--bench <n>] \
-                     [--files <json>] [--commit-at <s>] [--commit-count <n>] [--hover-file <path>] [--crop WxH] \
+                     [--files <json>] [--commit-at <s>] [--commit-count <n>] [--hover-file <path>] \
+                     [--crop WxH[+X+Y]] [--zoom <n>] [--no-vitals] [--hover-vital ram|gpu|cpu] \
                      | --frames <dir> [--duration <s>] [--fps <n>] [screenshot options]";
 
 fn parse_size(flag: &str, v: &str) -> Result<(u32, u32), String> {
     let parsed = v.split_once(['x', 'X']).and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)));
     match parsed {
         Some((w, h)) if w > 0 && h > 0 && w <= 8192 && h <= 8192 => Ok((w, h)),
+        _ => Err(format!("bad {flag} {v}")),
+    }
+}
+
+type Crop = ((u32, u32), Option<(u32, u32)>);
+
+/// `WxH`, or `WxH+X+Y` with its top-left corner.
+fn parse_crop(flag: &str, v: &str) -> Result<Crop, String> {
+    let mut parts = v.split('+');
+    let size = parse_size(flag, parts.next().unwrap_or(""))?;
+    let at: Vec<u32> = parts.map(|p| p.parse().map_err(|_| format!("bad {flag} {v}"))).collect::<Result<_, _>>()?;
+    match at[..] {
+        [] => Ok((size, None)),
+        [x, y] => Ok((size, Some((x, y)))),
         _ => Err(format!("bad {flag} {v}")),
     }
 }
@@ -100,6 +121,8 @@ fn parse(args: &[String]) -> Result<Mode, String> {
     let mut path = None;
     let mut size = None;
     let mut crop = None;
+    let mut crop_at = None;
+    let mut zoom = 1;
     let mut frames_dir = None;
     let mut duration = 12.0;
     let mut fps = 60.0;
@@ -115,7 +138,22 @@ fn parse(args: &[String]) -> Result<Mode, String> {
             "--duration" => duration = parse_secs(a, value()?, 0.01..=600.0)?,
             "--fps" => fps = parse_secs(a, value()?, 1.0..=240.0)?,
             "--size" => size = Some(parse_size(a, value()?)?),
-            "--crop" => crop = Some(parse_size(a, value()?)?),
+            "--crop" => {
+                let (size, at) = parse_crop(a, value()?)?;
+                (crop, crop_at) = (Some(size), at);
+            }
+            "--zoom" => {
+                let v = value()?;
+                zoom = match v.parse::<u32>() {
+                    Ok(z) if (1..=8).contains(&z) => z,
+                    _ => return Err(format!("bad --zoom {v}")),
+                };
+            }
+            "--no-vitals" => knot.no_vitals = true,
+            "--hover-vital" => {
+                let v = value()?;
+                knot.hover_vital = Some(vitals::Row::parse(v).ok_or(format!("bad --hover-vital {v}"))?);
+            }
             "--palette" => view.palette = true,
             "--link" => {
                 view.link = match value()?.as_str() {
@@ -170,10 +208,15 @@ fn parse(args: &[String]) -> Result<Mode, String> {
     if crop.is_some_and(|(w, h)| w > size.0 || h > size.1) {
         return Err(format!("--crop is larger than the {}x{} frame", size.0, size.1));
     }
+    if let (Some((w, h)), Some((x, y))) = (crop, crop_at) {
+        if x + w > size.0 || y + h > size.1 {
+            return Err(format!("--crop runs off the {}x{} frame", size.0, size.1));
+        }
+    }
     if path.is_none() && frames.is_none() {
         return Err("screenshot options need --screenshot <png> or --frames <dir>".into());
     }
-    Ok(Mode::Shot(Box::new(shot::Shot { path, size, crop, view, knot, frames })))
+    Ok(Mode::Shot(Box::new(shot::Shot { path, size, crop, crop_at, zoom, view, knot, frames })))
 }
 
 fn main() -> ExitCode {
@@ -242,5 +285,16 @@ mod tests {
         assert_eq!((s.size, s.crop), ((5120, 1440), Some((1920, 1080))));
         assert!(parse(&args("--frames out --crop 4000x100")).is_err());
         assert!(parse(&args("--crop 10x10")).is_err());
+    }
+
+    #[test]
+    fn placed_crop_zoom_and_vitals_flags() {
+        let Ok(Mode::Shot(s)) = parse(&args("--screenshot a.png --crop 600x700+0+300 --zoom 2 --hover-vital gpu")) else {
+            panic!("still should parse");
+        };
+        assert_eq!((s.crop, s.crop_at, s.zoom), (Some((600, 700)), Some((0, 300)), 2));
+        assert_eq!(s.knot.hover_vital, Some(vitals::Row::Gpu));
+        assert!(parse(&args("--screenshot a.png --crop 600x700+5000+0")).is_err());
+        assert!(parse(&args("--screenshot a.png --hover-vital disk")).is_err());
     }
 }

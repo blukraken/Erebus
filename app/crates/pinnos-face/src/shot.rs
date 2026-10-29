@@ -5,6 +5,7 @@ use crate::app::{context_files, context_text};
 use crate::gpu::Gpu;
 use crate::knot::{self, Flare, Sim};
 use crate::render::{Renderer, Scene, View};
+use crate::vitals::{self, Vitals};
 use pinnos_protocol::{ChangedFile, Context};
 use std::path::{Path, PathBuf};
 
@@ -12,8 +13,11 @@ pub struct Shot {
     /// The still; unused with `frames`.
     pub path: Option<PathBuf>,
     pub size: (u32, u32),
-    /// Writes only this centred region of each frame.
+    /// Writes only this region of each frame: centred, or at `crop_at`.
     pub crop: Option<(u32, u32)>,
+    pub crop_at: Option<(u32, u32)>,
+    /// Scales the written image up this many times, nearest neighbour.
+    pub zoom: u32,
     pub view: View,
     pub knot: KnotShot,
     pub frames: Option<Frames>,
@@ -46,6 +50,10 @@ pub struct KnotShot {
     pub hover_file: Option<String>,
     /// Frames to render offscreen before the still, timing the CPU each costs.
     pub bench: u32,
+    /// Leaves the vitals stack out.
+    pub no_vitals: bool,
+    /// Shows this vitals row's tooltip.
+    pub hover_vital: Option<vitals::Row>,
 }
 
 /// How far into a `--flare` the still is taken.
@@ -83,8 +91,8 @@ impl Target {
         Target { texture, view, readback, row, size: (w, h) }
     }
 
-    /// Draws `scene` and reads back the centred `crop` as packed RGB.
-    fn capture(&self, gpu: &Gpu, renderer: &mut Renderer, scene: &Scene, crop: (u32, u32)) -> Result<Vec<u8>, String> {
+    /// Draws `scene` and reads back `crop`, `[x, y, w, h]`, as packed RGB.
+    fn capture(&self, gpu: &Gpu, renderer: &mut Renderer, scene: &Scene, crop: [u32; 4]) -> Result<Vec<u8>, String> {
         let (w, h) = self.size;
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
         renderer.draw(gpu, &mut encoder, &self.view, (w, h), 1.0, scene);
@@ -112,8 +120,7 @@ impl Target {
         gpu.device.poll(wgpu::PollType::wait_indefinitely()).map_err(|e| format!("poll: {e}"))?;
         let rgb = {
             let data = slice.get_mapped_range().map_err(|e| format!("map: {e}"))?;
-            let (cw, ch) = crop;
-            let (x0, y0) = ((w - cw) / 2, (h - ch) / 2);
+            let [x0, y0, cw, ch] = crop;
             let mut rgb = Vec::with_capacity((cw * ch * 3) as usize);
             for y in y0 as usize..(y0 + ch) as usize {
                 let start = y * self.row as usize + x0 as usize * 4;
@@ -126,6 +133,22 @@ impl Target {
         self.readback.unmap();
         Ok(rgb)
     }
+}
+
+/// Scales packed RGB up `z` times, nearest neighbour.
+fn zoom(rgb: Vec<u8>, w: u32, z: u32) -> Vec<u8> {
+    if z <= 1 {
+        return rgb;
+    }
+    let (w, z) = (w as usize, z as usize);
+    let mut out = Vec::with_capacity(rgb.len() * z * z);
+    for row in rgb.chunks_exact(w * 3) {
+        let wide: Vec<u8> = row.as_chunks::<3>().0.iter().flat_map(|px| px.repeat(z)).collect();
+        for _ in 0..z {
+            out.extend_from_slice(&wide);
+        }
+    }
+    out
 }
 
 fn write_png(path: &Path, (w, h): (u32, u32), rgb: &[u8]) -> Result<(), String> {
@@ -144,7 +167,10 @@ fn write_png(path: &Path, (w, h): (u32, u32), rgb: &[u8]) -> Result<(), String> 
 pub fn run(shot: &Shot) -> Result<(), String> {
     let (gpu, _) = Gpu::new(None)?;
     let (w, h) = shot.size;
-    let crop = shot.crop.unwrap_or(shot.size);
+    let (cw, ch) = shot.crop.unwrap_or(shot.size);
+    let (cx, cy) = shot.crop_at.unwrap_or(((w - cw) / 2, (h - ch) / 2));
+    let crop = [cx, cy, cw, ch];
+    let out_size = (cw * shot.zoom, ch * shot.zoom);
     let format = wgpu::TextureFormat::Rgba8Unorm;
     let target = Target::new(&gpu, shot.size, format);
 
@@ -194,8 +220,16 @@ pub fn run(shot: &Shot) -> Result<(), String> {
         }
     }
 
+    // Canned vitals, 0.4 s after the newest sample at `--time`.
+    let mut now_ms = vitals::CANNED_T0 + 400 + (k.time * 1000.0) as u64;
+    let mut vt = if k.no_vitals { Vitals::default() } else { vitals::canned(canned_index(now_ms)) };
+    vt.hover = k.hover_vital;
+    vt.snap();
+    let column = vitals::column(w, h, 1.0);
+
     let mut renderer = Renderer::new(&gpu.device, &gpu.queue, format);
     let Some(frames) = &shot.frames else {
+        let vf = vt.frame(column.as_ref(), now_ms, (w, h), k.reduced);
         let more = if live { sim.files.more() } else { None };
         let file_label = file_label(&sim, k, centre, r);
         let scene = Scene {
@@ -209,12 +243,14 @@ pub fn run(shot: &Shot) -> Result<(), String> {
             file_label,
             file_label_alpha: sim.file_hover(),
             more: more.as_deref(),
+            vitals: vf.as_ref(),
         };
         if k.bench > 0 {
-            bench(&gpu, &mut renderer, &target.view, (w, h), &scene, &sim, k);
+            bench(&gpu, &mut renderer, &target.view, (w, h), &scene, &sim, k, &vt, now_ms);
         }
         let path = shot.path.as_deref().ok_or("no --screenshot path")?;
-        write_png(path, crop, &target.capture(&gpu, &mut renderer, &scene, crop)?)?;
+        let rgb = target.capture(&gpu, &mut renderer, &scene, crop)?;
+        write_png(path, out_size, &zoom(rgb, cw, shot.zoom))?;
         log::info!("screenshot {w}x{h} {:?} live {live} -> {}", shot.view, path.display());
         return Ok(());
     };
@@ -226,12 +262,16 @@ pub fn run(shot: &Shot) -> Result<(), String> {
     for i in 0..count {
         if i > 0 {
             sim.step(dt as f32, k.reduced);
+            now_ms = vitals::CANNED_T0 + 400 + ((k.time + f64::from(i) * dt) * 1000.0) as u64;
+            feed_canned(&mut vt, now_ms);
+            vt.step(dt as f32, k.reduced);
         }
         if pending.is_some_and(|at| f64::from(i) * dt >= at) {
             pending = None;
             commit(&mut sim);
         }
         let more = if live { sim.files.more() } else { None };
+        let vf = vt.frame(column.as_ref(), now_ms, (w, h), k.reduced);
         let scene = Scene {
             view: shot.view,
             knot: sim.uniform(w, h, 1.0, k.reduced),
@@ -243,22 +283,36 @@ pub fn run(shot: &Shot) -> Result<(), String> {
             file_label: file_label(&sim, k, centre, r),
             file_label_alpha: sim.file_hover(),
             more: more.as_deref(),
+            vitals: vf.as_ref(),
         };
         let rgb = target.capture(&gpu, &mut renderer, &scene, crop)?;
-        write_png(&frames.dir.join(format!("frame_{i:05}.png")), crop, &rgb)?;
+        write_png(&frames.dir.join(format!("frame_{i:05}.png")), out_size, &zoom(rgb, cw, shot.zoom))?;
         renderer.trim();
     }
     let line = format!(
         "frames {count} at {} fps, {}x{} -> {} in {:.1} s",
         frames.fps,
-        crop.0,
-        crop.1,
+        out_size.0,
+        out_size.1,
         frames.dir.display(),
         t0.elapsed().as_secs_f64()
     );
     log::info!("{line}");
     println!("{line}");
     Ok(())
+}
+
+/// The canned sample index current at `now_ms`.
+fn canned_index(now_ms: u64) -> i64 {
+    (now_ms as i64 - vitals::CANNED_T0 as i64).div_euclid(1000)
+}
+
+/// Delivers the canned samples due by `now_ms`, one a second as the core would.
+fn feed_canned(vt: &mut Vitals, now_ms: u64) {
+    let due = canned_index(now_ms);
+    while let Some(newest) = vt.newest_ms().map(canned_index).filter(|&i| i < due) {
+        vt.ingest(pinnos_protocol::Vitals { hw: vitals::canned_hw(), samples: vec![vitals::canned_sample(newest + 1)] });
+    }
 }
 
 /// The hovered glyph's path and where its label points.
@@ -279,24 +333,63 @@ fn process_cpu_us() -> u64 {
     t(kt) + t(u)
 }
 
-/// Renders frames as the window would, minus present, and logs CPU per frame.
-fn bench(gpu: &Gpu, renderer: &mut Renderer, target: &wgpu::TextureView, size: (u32, u32), scene: &Scene, sim: &Sim, k: &KnotShot) {
-    let mut sim = sim.clone();
-    let c0 = process_cpu_us();
-    let t0 = std::time::Instant::now();
-    for _ in 0..k.bench {
-        sim.step(1.0 / 60.0, k.reduced);
-        let frame = Scene { knot: sim.uniform(size.0, size.1, 1.0, k.reduced), ..*scene };
-        let mut encoder = gpu.device.create_command_encoder(&Default::default());
-        renderer.draw(gpu, &mut encoder, target, size, 1.0, &frame);
-        gpu.queue.submit([encoder.finish()]);
-        renderer.trim();
-        let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
-    }
-    let cpu = process_cpu_us() - c0;
-    let wall = t0.elapsed().as_micros() as u64;
+/// Renders frames as the window would, minus present, and logs CPU per frame. Then, where
+/// the adapter has timestamps, renders as many again with each pass timed and logs the GPU
+/// time before, during and after the vitals.
+#[allow(clippy::too_many_arguments)]
+fn bench(
+    gpu: &Gpu,
+    renderer: &mut Renderer,
+    target: &wgpu::TextureView,
+    size: (u32, u32),
+    scene: &Scene,
+    sim: &Sim,
+    k: &KnotShot,
+    vt: &Vitals,
+    now_ms: u64,
+) {
+    let column = vitals::column(size.0, size.1, 1.0);
+    let run = |renderer: &mut Renderer, timed: bool| {
+        let (mut sim, mut vt) = (sim.clone(), vt.clone());
+        let mut gpu_ms = [0.0; 3];
+        let c0 = process_cpu_us();
+        let t0 = std::time::Instant::now();
+        for i in 0..k.bench {
+            sim.step(1.0 / 60.0, k.reduced);
+            let now = now_ms + u64::from(i) * 1000 / 60;
+            feed_canned(&mut vt, now);
+            vt.step(1.0 / 60.0, k.reduced);
+            let vf = vt.frame(column.as_ref(), now, size, k.reduced);
+            let frame = Scene { knot: sim.uniform(size.0, size.1, 1.0, k.reduced), vitals: vf.as_ref(), ..*scene };
+            let mut encoder = gpu.device.create_command_encoder(&Default::default());
+            renderer.draw(gpu, &mut encoder, target, size, 1.0, &frame);
+            gpu.queue.submit([encoder.finish()]);
+            renderer.trim();
+            if timed {
+                if let Some(t) = renderer.pass_times(gpu) {
+                    gpu_ms = [0, 1, 2].map(|j| gpu_ms[j] + t[j]);
+                }
+            } else {
+                let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
+            }
+        }
+        (process_cpu_us() - c0, t0.elapsed().as_micros() as u64, gpu_ms)
+    };
     let n = u64::from(k.bench);
+    let (cpu, wall, _) = run(renderer, false);
     let line = format!("bench {n} frames: CPU {} us/frame, wall {} us/frame", cpu / n, wall / n);
+    log::info!("{line}");
+    println!("{line}");
+    if !renderer.time_passes(&gpu.device) {
+        println!("bench: no timestamp queries on this adapter; GPU time unmeasured");
+        return;
+    }
+    let (_, _, ms) = run(renderer, true);
+    let [a, b, c] = ms.map(|m| m / n as f64);
+    let line = format!(
+        "bench {n} frames, GPU ms/frame: ground+knot {a:.4}, vitals {b:.4}, shapes+text {c:.4}, total {:.4}",
+        a + b + c
+    );
     log::info!("{line}");
     println!("{line}");
 }
