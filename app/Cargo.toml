@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/pinnos-theme", "crates/pinnos-protocol", "crates/pinnos-core", "crates/pinnos-face"]
+members = ["crates/erebus-theme", "crates/erebus-protocol", "crates/erebus-core", "crates/erebus-face"]
 
 [workspace.package]
 edition = "2021"
@@ -9,8 +9,8 @@ license = "UNLICENSED"
 publish = false
 
 [workspace.dependencies]
-pinnos-theme = { path = "crates/pinnos-theme" }
-pinnos-protocol = { path = "crates/pinnos-protocol" }
+erebus-theme = { path = "crates/erebus-theme" }
+erebus-protocol = { path = "crates/erebus-protocol" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

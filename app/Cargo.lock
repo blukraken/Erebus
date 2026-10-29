@@ -415,6 +415,48 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
 
 [[package]]
+name = "erebus-core"
+version = "0.1.0"
+dependencies = [
+ "erebus-protocol",
+ "erebus-theme",
+ "notify",
+ "serde",
+ "tokio",
+ "toml",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "erebus-face"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "erebus-protocol",
+ "erebus-theme",
+ "glyphon",
+ "log",
+ "png",
+ "pollster",
+ "serde_json",
+ "wgpu",
+ "windows-sys 0.61.2",
+ "winit",
+]
+
+[[package]]
+name = "erebus-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "erebus-theme"
+version = "0.1.0"
+
+[[package]]
 name = "errno"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1410,48 +1452,6 @@ name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
-
-[[package]]
-name = "pinnos-core"
-version = "0.1.0"
-dependencies = [
- "notify",
- "pinnos-protocol",
- "pinnos-theme",
- "serde",
- "tokio",
- "toml",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "pinnos-face"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "glyphon",
- "log",
- "pinnos-protocol",
- "pinnos-theme",
- "png",
- "pollster",
- "serde_json",
- "wgpu",
- "windows-sys 0.61.2",
- "winit",
-]
-
-[[package]]
-name = "pinnos-protocol"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "pinnos-theme"
-version = "0.1.0"
 
 [[package]]
 name = "pkg-config"
