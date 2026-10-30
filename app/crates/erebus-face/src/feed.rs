@@ -5,7 +5,7 @@
 //! line over a short phrase, with a left rule in its kind's colour. A new row rises 10 px into
 //! place and fades in over 0.6 s while the rows above ease up a slot, and the top row fades as
 //! it crosses the feed's top edge. With reduced motion rows only cross-fade. History replayed
-//! on connect shows at once.
+//! on connect fades in where it sits, bottom row first, once the old rows have faded out.
 //!
 //! The wheel scrolls the history smoothly, with no bar. Scrolled up, the view holds still as
 //! new rows arrive below it; once the wheel rests, a "↓ live" chip offers the way back.
@@ -21,10 +21,18 @@ pub const KEEP: usize = 300;
 const OPACITY: [f32; ROWS] = [0.84, 0.87, 0.9, 0.93, 0.96, 1.0];
 const ENTER: f32 = 0.6;
 const REDUCED: f32 = 0.15;
+/// History fades in over `QUIET` without rising, each row `STAGGER` after the one below.
+/// Rows a reconnect replaces fade out over `LEAVE`.
+const QUIET: f32 = 0.35;
+const STAGGER: f32 = 0.07;
+const LEAVE: f32 = 0.3;
+/// A row's ground and the live chip's tint fade in and out over this long, seconds.
+const HOVER_FADE: f32 = 0.12;
 /// Rows ease toward their slots, and the view toward its scroll, with these time constants.
 const SETTLE: f32 = 0.12;
 const GLIDE: f32 = 0.09;
-/// The live chip shows once the wheel has rested this long, and fades in over the next.
+/// The live chip shows once the wheel has rested this long, and fades in over the next; it
+/// fades out as fast.
 const CHIP_AFTER: f32 = 0.4;
 const CHIP_FADE: f32 = 0.25;
 /// Prototype CSS pixels: `.fr` padding, the clock and phrase sizes, the gap between rows.
@@ -72,10 +80,22 @@ struct Row {
     id: u64,
     ev: FeedEvent,
     clock: String,
-    /// Feed time it arrived; `None` shows it settled at once.
+    /// Feed time its fade-in starts, while it runs; history's may lie ahead.
     born: Option<f64>,
+    /// History: it fades in where it sits, without rising.
+    quiet: bool,
     /// Drawn slot above the newest, in rows; eases toward its index.
     y: f32,
+    /// 0..1: how lit its hover ground is.
+    hover: f32,
+}
+
+/// A row on its way out after a reconnect: frozen in place, `y` from the bottom of the view.
+#[derive(Clone, Debug)]
+struct Ghost {
+    row: Row,
+    /// Seconds of fade left.
+    left: f32,
 }
 
 /// Rows, the scroll and their motion.
@@ -86,8 +106,10 @@ pub struct Feed {
     /// Feed time, seconds; runs only while something moves.
     clock: f64,
     next_id: u64,
-    /// The next batch is history: it shows at once.
+    /// The next batch is history: it fades in where it sits.
     replay: bool,
+    /// Rows a reconnect or a long run of history took out of view, fading.
+    gone: Vec<Ghost>,
     /// Rows scrolled back from the live end: drawn, and where the wheel has sent it.
     scroll: f32,
     target: f32,
@@ -96,6 +118,9 @@ pub struct Feed {
     unseen: usize,
     pub hover: Option<u64>,
     pub chip_hover: bool,
+    /// 0..1: how lit the live chip's edge and words are, and its opacity.
+    chip_lit: f32,
+    chip_a: f32,
 }
 
 impl Feed {
@@ -103,9 +128,24 @@ impl Feed {
         Feed { replay: true, ..Default::default() }
     }
 
-    /// Forgets every row; the core replays its history on reconnect.
+    /// Forgets every row; the core replays its history on reconnect. Rows in view fade out.
     pub fn clear(&mut self) {
-        *self = Feed { next_id: self.next_id, ..Feed::new() };
+        self.ghost_view();
+        let gone = std::mem::take(&mut self.gone);
+        *self = Feed { next_id: self.next_id, clock: self.clock, gone, chip_a: self.chip_a, ..Feed::new() };
+    }
+
+    /// Hands the rows in view to `gone`, to fade out where they are.
+    fn ghost_view(&mut self) {
+        let scroll = self.scroll;
+        let view = self.rows.iter().filter(|r| (-1.0..ROWS as f32).contains(&(r.y - scroll)));
+        let ghosts: Vec<Ghost> = view.map(|r| Ghost { row: Row { y: r.y - scroll, ..r.clone() }, left: LEAVE }).collect();
+        self.gone.extend(ghosts);
+    }
+
+    /// Seconds until every fading row is gone.
+    fn gone_left(&self) -> f32 {
+        self.gone.iter().map(|g| g.left).fold(0.0, f32::max)
     }
 
     /// Scrolled back from the live end.
@@ -113,11 +153,23 @@ impl Feed {
         self.target > 0.0
     }
 
-    /// Takes events, oldest first. Backlog and the first batch after a clear settle at once.
+    /// Takes events, oldest first. Backlog and the first batch after a clear are history: they
+    /// fade in where they sit, bottom row first, after any rows fading out.
     pub fn ingest(&mut self, events: Vec<FeedEvent>) {
         let replay = std::mem::replace(&mut self.replay, false);
-        for ev in events {
-            let instant = replay || ev.backlog;
+        let quiet_n = events.iter().filter(|e| replay || e.backlog).count();
+        let fresh = self.rows.is_empty();
+        // More history than the view holds would sweep the rows in view away at speed: they
+        // fade out, and the new view fades in.
+        let swap = !fresh && !self.scrolled() && quiet_n > ROWS;
+        if swap {
+            self.ghost_view();
+        }
+        let wait = self.gone_left();
+        let n = events.len();
+        for (i, ev) in events.into_iter().enumerate() {
+            let quiet = replay || ev.backlog;
+            let born = if quiet { self.clock + f64::from(wait + (n - 1 - i).min(ROWS) as f32 * STAGGER) } else { self.clock };
             self.next_id += 1;
             let clock = clock_text(ev.unix_ms);
             if self.scrolled() {
@@ -129,14 +181,22 @@ impl Feed {
                 self.target += 1.0;
                 self.unseen += 1;
             }
-            self.rows.push_back(Row { id: self.next_id, ev, clock, born: (!instant).then_some(self.clock), y: 0.0 });
+            self.rows.push_back(Row { id: self.next_id, ev, clock, born: Some(born), quiet, y: 0.0, hover: 0.0 });
             if self.rows.len() > KEEP {
                 self.rows.pop_front();
                 self.target = self.target.min(self.max_scroll());
                 self.scroll = self.scroll.min(self.max_scroll());
             }
-            if instant {
-                self.settle_slots();
+        }
+        if fresh || swap {
+            // Nothing in view moves: rows take their slots, and those that were already in
+            // the view fade back in with the history.
+            self.settle_slots();
+            for (k, r) in self.rows.iter_mut().rev().take(ROWS + 1).enumerate() {
+                if r.born.is_none() {
+                    r.born = Some(self.clock + f64::from(wait + k as f32 * STAGGER));
+                    r.quiet = true;
+                }
             }
         }
     }
@@ -150,7 +210,6 @@ impl Feed {
         let n = self.rows.len();
         for (i, r) in self.rows.iter_mut().enumerate() {
             r.y = (n - 1 - i) as f32;
-            r.born = None;
         }
     }
 
@@ -180,17 +239,26 @@ impl Feed {
         self.chip_hover = false;
     }
 
-    /// Opacity of the live chip.
-    fn chip_alpha(&self) -> f32 {
+    /// The cursor's target for a row's hover ground.
+    fn hover_of(&self, id: u64) -> f32 {
+        if self.hover == Some(id) { 1.0 } else { 0.0 }
+    }
+
+    /// The live chip's opacity once its fade settles.
+    fn chip_target(&self) -> f32 {
         if self.scrolled() { ((self.rest - CHIP_AFTER) / CHIP_FADE).clamp(0.0, 1.0) } else { 0.0 }
     }
 
     /// Something moves.
     pub fn busy(&self) -> bool {
         let n = self.rows.len();
-        let chip = self.scrolled() && self.rest < CHIP_AFTER + CHIP_FADE;
+        let chip = (self.scrolled() && self.rest < CHIP_AFTER + CHIP_FADE) || self.chip_a != self.chip_target();
         chip || (self.scroll - self.target).abs() > 0.001
-            || self.rows.iter().enumerate().any(|(i, r)| r.born.is_some() || (r.y - (n - 1 - i) as f32).abs() > 0.002)
+            || !self.gone.is_empty()
+            || self.chip_lit != f32::from(u8::from(self.chip_hover))
+            || self.rows.iter().enumerate().any(|(i, r)| {
+                r.born.is_some() || (r.y - (n - 1 - i) as f32).abs() > 0.002 || r.hover != self.hover_of(r.id)
+            })
     }
 
     pub fn step(&mut self, dt: f32, reduced: bool) {
@@ -205,16 +273,29 @@ impl Feed {
         let ease = |tau: f32| if reduced { 1.0 } else { 1.0 - (-dt / tau).exp() };
         let n = self.rows.len();
         let k = ease(SETTLE);
+        let lit = dt / HOVER_FADE;
+        let hovered = self.hover;
         for (i, r) in self.rows.iter_mut().enumerate() {
             let t = (n - 1 - i) as f32;
             r.y += (t - r.y) * k;
             if (t - r.y).abs() < 0.002 {
                 r.y = t;
             }
-            if r.born.is_some_and(|b| now - b >= f64::from(enter)) {
+            let span = if reduced { REDUCED } else if r.quiet { QUIET } else { enter };
+            if r.born.is_some_and(|b| now - b >= f64::from(span)) {
                 r.born = None;
             }
+            r.hover = approach(r.hover, if hovered == Some(r.id) { 1.0 } else { 0.0 }, lit);
         }
+        self.chip_lit = approach(self.chip_lit, f32::from(u8::from(self.chip_hover)), lit);
+        let t = self.chip_target();
+        self.chip_a = if t >= self.chip_a { t } else { (self.chip_a - dt / CHIP_FADE).max(t) };
+        // Reduced motion fades them out at the cross-fade's pace.
+        let leave = if reduced { dt * LEAVE / REDUCED } else { dt };
+        for g in &mut self.gone {
+            g.left -= leave;
+        }
+        self.gone.retain(|g| g.left > 0.0);
         self.scroll += (self.target - self.scroll) * ease(GLIDE);
         if (self.target - self.scroll).abs() < 0.001 {
             self.scroll = self.target;
@@ -224,8 +305,21 @@ impl Feed {
     /// Finishes all motion at once.
     pub fn snap(&mut self) {
         self.settle_slots();
+        let hovered = self.hover;
+        for r in &mut self.rows {
+            r.born = None;
+            r.hover = if hovered == Some(r.id) { 1.0 } else { 0.0 };
+        }
+        self.chip_lit = f32::from(u8::from(self.chip_hover));
+        self.chip_a = self.chip_target();
+        self.gone.clear();
         self.scroll = self.target;
     }
+}
+
+/// `v` moved toward `target` by at most `step`.
+fn approach(v: f32, target: f32, step: f32) -> f32 {
+    if v < target { (v + step).min(target) } else { (v - step).max(target) }
 }
 
 /// `HH:MM:SS` in local time.
@@ -307,17 +401,18 @@ pub struct RowFrame {
     pub rect: [f32; 4],
     pub alpha: f32,
     pub color: Rgb,
-    pub hover: bool,
+    /// 0..1: how lit its hover ground is.
+    pub hover: f32,
     /// A turn's end: a wash of its colour fades out from the rule.
     pub wash: bool,
 }
 
-/// The live chip's words and opacity.
+/// The live chip's words, opacity, and how lit it is by the cursor, 0..1.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Chip {
     pub text: String,
     pub alpha: f32,
-    pub hover: bool,
+    pub hover: f32,
 }
 
 pub struct Frame {
@@ -361,7 +456,8 @@ impl Feed {
         if f.chip.as_ref().is_some_and(|c| c.alpha > 0.5) && inside(f.layout.chip()) {
             return Some(Spot::Chip);
         }
-        if let Some(r) = f.rows.iter().find(|r| r.alpha > 0.5 && inside(r.rect)) {
+        let live = |id: u64| self.rows.iter().any(|r| r.id == id);
+        if let Some(r) = f.rows.iter().find(|r| r.alpha > 0.5 && inside(r.rect) && live(r.id)) {
             return Some(Spot::Row(r.id));
         }
         inside(f.layout.rect).then_some(Spot::Ground)
@@ -369,7 +465,7 @@ impl Feed {
 
     /// Builds the feed, or `None` while it is empty.
     pub fn frame(&self, col: &crate::vitals::Column, reduced: bool) -> Option<Frame> {
-        if self.rows.is_empty() {
+        if self.rows.is_empty() && self.gone.is_empty() {
             return None;
         }
         let l = layout(col);
@@ -380,9 +476,11 @@ impl Feed {
         let top_slot = ROWS as f32 - 1.0;
 
         let mut rows = Vec::with_capacity(ROWS + 2);
-        for r in &self.rows {
+        // Rows fading out sit under the rows in view.
+        let gone = self.gone.iter().map(|g| (&g.row, 0.0, smooth(g.left / LEAVE)));
+        for (r, scroll, fade) in gone.chain(self.rows.iter().map(|r| (r, self.scroll, 1.0))) {
             // Place in the view, in rows above the bottom one.
-            let v = r.y - self.scroll;
+            let v = r.y - scroll;
             if !(-1.0..ROWS as f32).contains(&v) {
                 continue;
             }
@@ -392,25 +490,28 @@ impl Feed {
             let mut a = OPACITY[i] + (OPACITY[(i + 1).min(ROWS - 1)] - OPACITY[i]) * f;
             // Rows fade as they cross the top or bottom edge.
             a *= (1.0 - (v - top_slot)).clamp(0.0, 1.0) * (1.0 + v).clamp(0.0, 1.0);
+            let mut shown = fade;
             if let Some(b) = r.born {
-                let t = ((self.clock - b) as f32 / enter).clamp(0.0, 1.0);
-                a *= smooth(t);
-                if !reduced {
+                let span = if reduced { REDUCED } else if r.quiet { QUIET } else { enter };
+                let t = ((self.clock - b) as f32 / span).clamp(0.0, 1.0);
+                shown *= smooth(t);
+                if !reduced && !r.quiet {
                     top += lift * (1.0 - smooth(t));
                 }
             }
+            // Hover lifts the row to full strength, but never ahead of its fade.
+            let a = (a + (1.0 - a) * r.hover) * shown;
             if a <= 0.0 {
                 continue;
             }
-            let hover = self.hover == Some(r.id);
             rows.push(RowFrame {
                 id: r.id,
                 clock: r.clock.clone(),
                 phrase: r.ev.phrase.clone(),
                 rect: [l.row_x, top.round(), l.row_w, l.row_h],
-                alpha: if hover { 1.0 } else { a },
+                alpha: a,
                 color: color(r.ev.kind),
-                hover,
+                hover: r.hover * shown,
                 wash: r.ev.kind == FeedKind::Turn,
             });
         }
@@ -424,8 +525,8 @@ impl Feed {
             if b <= t {
                 continue;
             }
-            if r.hover {
-                rects.push(([rx, t, rw, b - t], HOVER, 1.0));
+            if r.hover > 0.0 {
+                rects.push(([rx, t, rw, b - t], HOVER, r.hover));
             }
             rects.push(([rx, t, 2.0 * l.px, b - t], r.color, 0.9 * r.alpha));
             if r.wash {
@@ -436,15 +537,15 @@ impl Feed {
             }
         }
 
-        let ca = self.chip_alpha();
+        let ca = self.chip_a;
         let chip = (ca > 0.0).then(|| {
             let c = l.chip();
             let hair = l.px.round().max(1.0);
-            let edge = if self.chip_hover { theme::EMBER } else { theme::RULE_2 };
+            let edge = crate::vitals::mix(theme::RULE_2, theme::EMBER, self.chip_lit);
             rects.push((c, edge, ca));
             rects.push(([c[0] + hair, c[1] + hair, c[2] - 2.0 * hair, c[3] - 2.0 * hair], theme::SLAB, ca));
             let text = if self.unseen > 0 { format!("↓ live · {} new", self.unseen) } else { "↓ live".into() };
-            Chip { text, alpha: ca, hover: self.chip_hover }
+            Chip { text, alpha: ca, hover: self.chip_lit }
         });
         Some(Frame { layout: l, rows, rects, washes, chip })
     }
@@ -503,15 +604,121 @@ mod tests {
         f.frame(&col(), false).unwrap().rows.iter().filter(|r| r.alpha > 0.5).map(|r| r.phrase.clone()).collect()
     }
 
+    fn row(fr: &Frame, n: u64) -> Option<&RowFrame> {
+        fr.rows.iter().find(|r| r.phrase.ends_with(&format!("f{n}.rs")))
+    }
+
     #[test]
-    fn replay_settles_at_once_and_shows_six() {
+    fn replay_fades_in_bottom_up_in_place_and_shows_six() {
         let mut f = Feed::new();
         f.ingest((0..10).map(|i| ev(i, false)).collect());
-        assert!(!f.busy());
+        assert!(f.busy());
+        assert!(f.frame(&col(), false).unwrap().rows.is_empty(), "nothing shows at once");
+        run(&mut f, 0.15);
+        let fr = f.frame(&col(), false).unwrap();
+        let bottom = row(&fr, 9).unwrap();
+        assert!(bottom.alpha > 0.05 && bottom.alpha < 0.95, "the bottom row is fading in: {}", bottom.alpha);
+        assert!(row(&fr, 4).is_none_or(|r| r.alpha < bottom.alpha), "the top row follows");
+        let y_then = bottom.rect[1];
+        run(&mut f, 1.0);
+        assert!(!f.busy(), "done within a second and a bit");
+        let fr = f.frame(&col(), false).unwrap();
+        assert_eq!(row(&fr, 9).unwrap().rect[1], y_then, "history does not rise");
         let s = shown(&f);
         assert_eq!(s.len(), ROWS);
         assert_eq!(s.first().unwrap(), "erebus · Read f4.rs");
         assert_eq!(s.last().unwrap(), "erebus · Read f9.rs");
+    }
+
+    #[test]
+    fn replay_is_done_within_a_second() {
+        let mut f = Feed::new();
+        f.ingest((0..300).map(|i| ev(i, false)).collect());
+        run(&mut f, 1.0);
+        assert!(!f.busy());
+    }
+
+    #[test]
+    fn a_hovered_row_lights_gradually() {
+        let mut f = Feed::new();
+        f.ingest((0..6).map(|i| ev(i, false)).collect());
+        f.snap();
+        let id = f.frame(&col(), false).unwrap().rows[0].id;
+        let before = f.frame(&col(), false).unwrap().rows[0].alpha;
+        f.hover = Some(id);
+        assert!(f.busy());
+        run(&mut f, 0.05);
+        let r = f.frame(&col(), false).unwrap().rows[0].clone();
+        assert!(r.hover > 0.05 && r.hover < 0.95, "the ground fades in: {}", r.hover);
+        assert!(r.alpha > before && r.alpha < 1.0, "the words brighten: {}", r.alpha);
+        run(&mut f, 0.5);
+        let r = f.frame(&col(), false).unwrap().rows[0].clone();
+        assert_eq!((r.hover, r.alpha), (1.0, 1.0));
+        f.hover = None;
+        run(&mut f, 0.05);
+        let h = f.frame(&col(), false).unwrap().rows[0].hover;
+        assert!(h > 0.05 && h < 0.95, "and fades out: {h}");
+    }
+
+    #[test]
+    fn the_live_chip_warms_gradually_under_the_cursor() {
+        let mut f = Feed::new();
+        f.ingest((0..20).map(|i| ev(i, false)).collect());
+        f.scroll_by(3.0);
+        run(&mut f, 1.0);
+        let edge = |f: &Feed| f.frame(&col(), false).unwrap().rects.iter().find(|r| r.0 == layout(&col()).chip()).unwrap().1;
+        assert_eq!(edge(&f), theme::RULE_2);
+        f.chip_hover = true;
+        run(&mut f, 0.05);
+        let (e, lit) = (edge(&f), f.frame(&col(), false).unwrap().chip.unwrap().hover);
+        assert!(e != theme::RULE_2 && e != theme::EMBER, "the edge is between: {e:?}");
+        assert!(lit > 0.05 && lit < 0.95, "{lit}");
+        run(&mut f, 0.5);
+        assert_eq!(edge(&f), theme::EMBER);
+    }
+
+    #[test]
+    fn the_live_chip_fades_out_when_clicked() {
+        let mut f = Feed::new();
+        f.ingest((0..20).map(|i| ev(i, false)).collect());
+        f.scroll_by(3.0);
+        run(&mut f, 1.0);
+        f.go_live();
+        assert!(f.busy());
+        f.step(0.1, false);
+        let a = f.frame(&col(), false).unwrap().chip.unwrap().alpha;
+        assert!(a > 0.05 && a < 0.95, "{a}");
+        run(&mut f, 0.5);
+        assert!(f.frame(&col(), false).unwrap().chip.is_none());
+    }
+
+    #[test]
+    fn history_arriving_while_scrolled_back_holds_the_view() {
+        let mut f = Feed::new();
+        f.ingest((0..20).map(|i| ev(i, false)).collect());
+        f.scroll_by(5.0);
+        run(&mut f, 1.0);
+        let before = f.frame(&col(), false).unwrap().rows;
+        f.ingest((20..40).map(|i| ev(i, true)).collect());
+        f.step(1.0 / 60.0, false);
+        let after = f.frame(&col(), false).unwrap().rows;
+        assert_eq!(after.iter().map(|r| (r.id, r.rect, r.alpha)).collect::<Vec<_>>(), before.iter().map(|r| (r.id, r.rect, r.alpha)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_long_run_of_history_swaps_the_view_by_fading() {
+        let mut f = Feed::new();
+        f.ingest((0..6).map(|i| ev(i, false)).collect());
+        f.snap();
+        f.ingest((6..30).map(|i| ev(i, true)).collect());
+        run(&mut f, 0.1);
+        let fr = f.frame(&col(), false).unwrap();
+        let old = row(&fr, 5).unwrap();
+        assert!(old.alpha > 0.05 && old.alpha < 0.95, "the old view fades out: {}", old.alpha);
+        assert!(row(&fr, 29).is_none(), "the new view waits for it");
+        run(&mut f, 1.5);
+        assert!(!f.busy());
+        assert_eq!(shown(&f).last().unwrap(), "erebus · Read f29.rs");
     }
 
     #[test]
@@ -575,6 +782,7 @@ mod tests {
     fn rows_sit_bottom_up_inside_the_feed() {
         let mut f = Feed::new();
         f.ingest((0..6).map(|i| ev(i, false)).collect());
+        run(&mut f, 1.0);
         let fr = f.frame(&col(), false).unwrap();
         let [_, y, _, h] = fr.layout.rect;
         let last = fr.rows.last().unwrap().rect;
@@ -583,14 +791,30 @@ mod tests {
     }
 
     #[test]
-    fn clear_then_replay_does_not_animate() {
+    fn clear_fades_the_old_rows_out_before_the_replay_fades_in() {
         let mut f = Feed::new();
         f.ingest(vec![ev(0, false)]);
         f.ingest(vec![ev(1, false)]);
+        run(&mut f, 1.0);
         f.clear();
-        assert!(f.frame(&col(), false).is_none());
+        assert_eq!(f.frame(&col(), false).unwrap().rows.len(), 2, "the old rows stay a moment");
+        run(&mut f, 0.1);
+        let a = f.frame(&col(), false).unwrap().rows[0].alpha;
+        assert!(a > 0.05 && a < 0.8, "and fade out: {a}");
+        assert_eq!(f.hit(&col(), 0.0, 0.0), None);
         f.ingest((0..3).map(|i| ev(i, false)).collect());
+        // Old and new never show at full strength together.
+        for _ in 0..90 {
+            f.step(1.0 / 60.0, false);
+            let fr = f.frame(&col(), false).unwrap();
+            let (old, new): (Vec<_>, Vec<_>) = fr.rows.iter().partition(|r| r.id <= 2);
+            if old.iter().any(|r| r.alpha > 0.0) {
+                assert!(new.iter().all(|r| r.alpha == 0.0), "a replayed row shows over a fading one");
+            }
+        }
+        run(&mut f, 1.0);
         assert!(!f.busy());
+        assert_eq!(shown(&f).len(), 3);
     }
 
     #[test]

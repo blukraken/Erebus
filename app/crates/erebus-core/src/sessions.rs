@@ -29,9 +29,10 @@
 //!
 //! A background task is a shell or Monitor that outlives its tool call. It is live from the result
 //! that names it (`toolUseResult.backgroundTaskId`, or `taskId` for Monitor) until its task
-//! notification, a TaskStop or KillShell call, a Monitor expiry notice, or the session ends. Tasks
-//! left over after 30 minutes of transcript silence are dropped. A session reads as idle only when
-//! no worker and no task is live and no turn is under way.
+//! notification, a TaskStop or KillShell call, a Monitor expiry notice, or the session ends. A
+//! shell also ends once Claude Code lets go of its output file. Tasks left over after 30 minutes
+//! of transcript silence are dropped, unless their output file is still held. A session reads as
+//! idle only when no worker and no task is live and no turn is under way.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -591,6 +592,49 @@ struct Task {
     kind: TaskKind,
     label: String,
     started_ms: u64,
+    /// A shell's output file, which Claude Code holds open while the shell runs.
+    output: Option<PathBuf>,
+    /// The output file has been seen held, and was held on the last pass.
+    seen: bool,
+    held: bool,
+}
+
+/// Claude Code writes a background shell's output to
+/// `<temp>\claude\<project folder>\<session id>\tasks\<task id>.output`, mirroring the transcript's
+/// own project folder and file name.
+fn output_path(transcript: &Path, task: &str) -> Option<PathBuf> {
+    let project = transcript.parent()?.file_name()?;
+    let session = transcript.file_stem()?;
+    Some(std::env::temp_dir().join("claude").join(project).join(session).join("tasks").join(format!("{task}.output")))
+}
+
+/// What a shell's output file says about the shell.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Probe {
+    Held,
+    Free,
+    Missing,
+    Unknown,
+}
+
+/// Opens the file for reading and refuses only a writer, so it fails while the shell still
+/// writes and never blocks another reader. The handle drops at once.
+#[cfg(windows)]
+fn probe(path: &Path) -> Probe {
+    use std::os::windows::fs::OpenOptionsExt;
+    const SHARE_READ_DELETE: u32 = 0x1 | 0x4;
+    const SHARING_VIOLATION: i32 = 32;
+    match fs::OpenOptions::new().read(true).share_mode(SHARE_READ_DELETE).open(path) {
+        Ok(_) => Probe::Free,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Probe::Missing,
+        Err(e) if e.raw_os_error() == Some(SHARING_VIOLATION) => Probe::Held,
+        Err(_) => Probe::Unknown,
+    }
+}
+
+#[cfg(not(windows))]
+fn probe(_: &Path) -> Probe {
+    Probe::Unknown
 }
 
 struct Agent {
@@ -746,9 +790,28 @@ impl Session {
             for (fact, ms) in facts {
                 self.apply(None, fact, ms, mode, asks, out);
             }
-            if !self.tasks.is_empty() && now.saturating_sub(quiet_since) > STALE_WORKER_MS {
-                self.tasks.clear();
-                let at = if mode == Mode::Backlog { quiet_since } else { now };
+            let at = if mode == Mode::Backlog { quiet_since } else { now };
+            let before = self.tasks.len();
+            self.tasks.retain(|_, t| {
+                let Some(path) = &t.output else { return true };
+                let p = probe(path);
+                t.held = p == Probe::Held;
+                t.seen |= t.held;
+                let ended = p == Probe::Free || (p == Probe::Missing && t.seen);
+                if ended {
+                    log_info!("task {} {} ended (output let go)", self.label, t.task_id);
+                }
+                !ended
+            });
+            if now.saturating_sub(quiet_since) > STALE_WORKER_MS {
+                self.tasks.retain(|_, t| {
+                    if !t.held {
+                        log_info!("task {} {} ended (stale)", self.label, t.task_id);
+                    }
+                    t.held
+                });
+            }
+            if self.tasks.len() != before {
                 self.settle(out, mode, at);
             }
         }
@@ -985,7 +1048,13 @@ impl Session {
                     } else if let Some(task) = bg_task.or_else(|| monitor_task.filter(|_| tool == "Monitor")) {
                         if !error {
                             let kind = if tool == "Monitor" { TaskKind::Monitor } else { TaskKind::Shell };
-                            self.tasks.insert(id, Task { task_id: task, kind, label, started_ms: started });
+                            let output = (kind == TaskKind::Shell)
+                                .then(|| self.transcript.as_ref().and_then(|t| output_path(&t.path, &task)))
+                                .flatten();
+                            if mode == Mode::Live {
+                                log_info!("task {} {task} started ({kind:?}, output {})", self.label, output.as_ref().map_or("none".into(), |p| p.display().to_string()));
+                            }
+                            self.tasks.insert(id, Task { task_id: task, kind, label, started_ms: started, output, seen: false, held: false });
                         }
                     }
                 }
@@ -2554,6 +2623,67 @@ mod tests {
         assert_eq!(events.last().map(|e| e.phrase.as_str()), Some("alpha · idle"));
         assert!(!events.last().unwrap().backlog);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn probe_reads_a_writer_as_held() {
+        let dir = std::env::temp_dir().join(format!("erebus-probe-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t1.output");
+        let writer = File::create(&path).unwrap();
+        assert_eq!(probe(&path), Probe::Held);
+        // A reader beside the writer is not refused.
+        assert!(File::open(&path).is_ok());
+        drop(writer);
+        assert_eq!(probe(&path), Probe::Free);
+        fs::remove_file(&path).unwrap();
+        assert_eq!(probe(&path), Probe::Missing);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn output_path_mirrors_the_transcript() {
+        let p = output_path(Path::new(r"C:\Users\u\.claude\projects\F--Proj\abc.jsonl"), "bx1").unwrap();
+        assert_eq!(p, std::env::temp_dir().join(r"claude\F--Proj\abc\tasks\bx1.output"));
+    }
+
+    /// A shell ends when its output file is let go, and outlives transcript silence while held.
+    #[cfg(windows)]
+    #[test]
+    fn shell_follows_its_output_file() {
+        let project = format!("erebus-held-{}", std::process::id());
+        let dir = std::env::temp_dir().join(&project);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s1.jsonl");
+        let mut lines = vec![prompt(1000)];
+        lines.extend(shell("b1", "t1", 1001));
+        lines.extend(shell("b2", "t2", 1002));
+        lines.push(turn_end(0, 2000));
+        fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let tasks = output_path(&path, "t1").unwrap().parent().unwrap().to_owned();
+        fs::create_dir_all(&tasks).unwrap();
+        let w1 = File::create(tasks.join("t1.output")).unwrap();
+        let w2 = File::create(tasks.join("t2.output")).unwrap();
+
+        let last = parse_ts(&ts(2000)).unwrap();
+        let mut s = session("alpha");
+        s.transcript = Some(Tail::open(path.clone(), false));
+        let mut asks = Asks::default();
+        let mut out = Out::default();
+        s.follow(&dir, last + 1000, &mut asks, &mut out);
+        assert_eq!(s.tasks.len(), 2);
+        drop(w1);
+        s.follow(&dir, last + 3000, &mut asks, &mut out);
+        assert_eq!(s.tasks.keys().collect::<Vec<_>>(), ["b2"]);
+        s.follow(&dir, last + 2 * STALE_WORKER_MS, &mut asks, &mut out);
+        assert_eq!(s.tasks.len(), 1, "a held shell outlives the silence rule");
+        drop(w2);
+        s.follow(&dir, last + 2 * STALE_WORKER_MS + 2000, &mut asks, &mut out);
+        assert!(s.tasks.is_empty());
+        assert_eq!(out.finish().last().map(|e| e.phrase.as_str()), Some("alpha · idle"));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(std::env::temp_dir().join("claude").join(&project));
     }
 
     #[test]

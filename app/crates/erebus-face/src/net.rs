@@ -79,6 +79,10 @@ const REST_SCALE: f32 = 0.8;
 const HOVER_GROW: f32 = 1.14;
 const HOVER_TAU: f32 = 0.11;
 const PING_SECS: f32 = 2.4;
+/// A name chip whose words change cross-fades old to new over this long, seconds; a ping's
+/// chip fades in over `PING_RISE`.
+const WORDS_SWAP: f32 = 0.25;
+const PING_RISE: f32 = 0.15;
 
 // Sizes and distances in knot radii; the knot is 270 px at 5120×1440.
 const SESSION_R: f32 = 64.0 / 270.0;
@@ -216,12 +220,72 @@ struct Lit {
     whole: bool,
 }
 
+/// A name chip's words: the last ones set, the ones before, and how far the change has
+/// cross-faded, 0..1.
+#[derive(Clone, Debug)]
+struct Words {
+    now: String,
+    was: String,
+    swap: f32,
+}
+
+impl Default for Words {
+    fn default() -> Self {
+        Words { now: String::new(), was: String::new(), swap: 1.0 }
+    }
+}
+
+impl Words {
+    /// Takes the chip's words. A change while the chip shows cross-fades from the old words.
+    fn set(&mut self, text: String, shown: bool) {
+        if text == self.now {
+            return;
+        }
+        self.was = std::mem::replace(&mut self.now, text);
+        self.swap = if shown && !self.was.is_empty() { 0.0 } else { 1.0 };
+    }
+
+    fn step(&mut self, dt: f32, span: f32) {
+        self.swap = (self.swap + dt / span).min(1.0);
+    }
+
+    fn busy(&self) -> bool {
+        self.swap < 1.0
+    }
+
+    /// Adds the chip for `text` at `at` with opacity `show`. While a change runs, the old words
+    /// fade out over the chip's steady ground as the new ones fade in.
+    fn push(&self, out: &mut Vec<Label>, text: String, at: [f32; 2], show: f32) {
+        let k = if text == self.now { smooth(self.swap) } else { 1.0 };
+        if k < 1.0 && !self.was.is_empty() && self.was != text {
+            out.push(Label { text: self.was.clone(), at, alpha: show * (1.0 - k), ground: show * (1.0 - k) });
+        }
+        out.push(Label { text, at, alpha: show * k, ground: show });
+    }
+}
+
+fn smooth(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// A chip's opacity as its owner's form passes `at`: it fades across a fifth of the form.
+fn formed(form: f32, at: f32) -> f32 {
+    smooth((form - at) / 0.2 + 0.5)
+}
+
+/// A ping's chip: it fades in over `PING_RISE`, holds, and fades out by `PING_SECS`.
+fn ping_show(ping: Option<f32>) -> f32 {
+    ping.map_or(0.0, |t| smooth(t / PING_RISE) * ((1.0 - t / PING_SECS) * 4.0).min(1.0))
+}
+
 /// A background shell or monitor, reaching out from its session's globe.
 #[derive(Clone, Debug)]
 struct Reach {
     id: String,
     kind: TaskKind,
     label: String,
+    words: Words,
     /// 0..1: grown out, or what is left as it unravels.
     form: f32,
     /// Its angle round the globe, easing toward its slot.
@@ -234,12 +298,30 @@ struct Reach {
     age: f32,
 }
 
+impl Worker {
+    fn words(&self, parent: &str) -> String {
+        format!("{parent}·{} · {}", self.label, self.kind)
+    }
+
+    fn show(&self) -> f32 {
+        self.hover.max(ping_show(self.ping))
+    }
+}
+
+impl Reach {
+    fn words(&self, parent: &str) -> String {
+        let what = if self.kind == TaskKind::Monitor { "monitor" } else { "shell" };
+        format!("{parent} · {what} {}", self.label)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Worker {
     id: String,
     /// "w1", and the agent type, for its name chip.
     label: String,
     kind: String,
+    words: Words,
     hover: f32,
     /// Its angle in the fan, radians, easing toward its slot as workers come and go.
     ang: f32,
@@ -278,6 +360,7 @@ struct Globe {
     /// Wall time of the last sign of work, milliseconds.
     active_ms: u64,
     workers: Vec<Worker>,
+    words: Words,
     hover: f32,
     /// Seconds since a feed click pinged it, while the ping lasts.
     ping: Option<f32>,
@@ -395,6 +478,23 @@ fn len(v: [f32; 2]) -> f32 {
 }
 
 impl Globe {
+    /// The session chip's words: its name, its state and its workers.
+    fn words(&self) -> String {
+        let state = if self.waiting { "waiting" } else if self.busy { "busy" } else { "idle" };
+        let mut staying = self.workers.iter().filter(|w| !w.leaving);
+        let workers = match (staying.next(), staying.count()) {
+            (None, _) => String::new(),
+            (Some(w), 0) => format!(" · {}", w.kind),
+            (Some(_), n) => format!(" · {} workers", n + 1),
+        };
+        format!("{} · {state}{workers}", self.label)
+    }
+
+    /// How much the session chip shows, from hover or a ping.
+    fn show(&self) -> f32 {
+        self.hover.max(ping_show(self.ping))
+    }
+
     /// Work under way: a turn, a live worker, or a background task, even one silently
     /// waiting on a long job.
     fn working(&self) -> bool {
@@ -508,6 +608,7 @@ impl Net {
                         form: if instant { -STAGGER / CONDENSE * self.globes.len() as f32 } else { 0.0 },
                         active_ms: s.started_unix_ms,
                         workers: Vec::new(),
+                        words: Words::default(),
                         hover: 0.0,
                         ping: None,
                         twist: 0.0,
@@ -559,7 +660,7 @@ impl Net {
             }
             for w in &s.workers {
                 if !g.workers.iter().any(|x| x.id == w.id && !x.leaving) {
-                    g.workers.push(Worker { id: w.id.clone(), label: w.label.clone(), kind: w.kind.clone(), hover: 0.0, ang: f32::NAN, ping: None, pulses: Pulses::default(), twist: g.twist, emerge: 0.0, form: 0.0, leaving: false });
+                    g.workers.push(Worker { id: w.id.clone(), label: w.label.clone(), kind: w.kind.clone(), words: Words::default(), hover: 0.0, ang: f32::NAN, ping: None, pulses: Pulses::default(), twist: g.twist, emerge: 0.0, form: 0.0, leaving: false });
                 }
             }
             for x in &mut g.workers {
@@ -577,7 +678,7 @@ impl Net {
                     // The side with fewer reaches, above first.
                     let count = |side: f32| g.tasks.iter().filter(|x| !x.leaving && x.side == side).count();
                     let side = if count(-1.0) <= count(1.0) { -1.0 } else { 1.0 };
-                    g.tasks.push(Reach { id: t.id.clone(), kind: t.kind, label: t.label.clone(), form: 0.0, ang: f32::NAN, side, hover: 0.0, leaving: false, age: 0.0 });
+                    g.tasks.push(Reach { id: t.id.clone(), kind: t.kind, label: t.label.clone(), words: Words::default(), form: 0.0, ang: f32::NAN, side, hover: 0.0, leaving: false, age: 0.0 });
                 }
             }
             for x in &mut g.tasks {
@@ -713,6 +814,9 @@ impl Net {
                 || g.pulses.busy()
                 || g.hold > 0.0
                 || g.tasks.iter().any(|r| r.leaving || r.form < 1.0)
+                || g.words.busy()
+                || g.workers.iter().any(|w| w.words.busy())
+                || g.tasks.iter().any(|r| r.words.busy() || (r.hover - if self.hover.as_deref() == Some(&r.id) { 1.0 } else { 0.0 }).abs() > 0.001)
                 || (g.hover - if self.hover.as_deref() == Some(&g.id) { 1.0 } else { 0.0 }).abs() > 0.001
                 || g.workers.iter().any(|w| (w.hover - if self.hover.as_deref() == Some(&w.id) { 1.0 } else { 0.0 }).abs() > 0.001)
         })
@@ -839,6 +943,22 @@ impl Net {
                 r.form = if held && !r.leaving { (r.form + dt / quick(REACH_GROW)).min(1.0) } else { (r.form - dt / quick(REACH_UNRAVEL)).max(0.0) };
             }
             g.tasks.retain(|r| !(r.leaving && r.form <= 0.0));
+
+            // Name chips cross-fade when their words change while they show.
+            let swap = quick(WORDS_SWAP);
+            for w in &mut g.workers {
+                let (text, shown) = (w.words(&g.label), w.show() > 0.01);
+                w.words.set(text, shown);
+                w.words.step(dt, swap);
+            }
+            for r in &mut g.tasks {
+                let (text, shown) = (r.words(&g.label), r.hover > 0.01);
+                r.words.set(text, shown);
+                r.words.step(dt, swap);
+            }
+            let (text, shown) = (g.words(), g.show() > 0.01);
+            g.words.set(text, shown);
+            g.words.step(dt, swap);
         }
         self.globes.retain(|g| !(g.phase == Phase::Dissolving && g.form <= 0.0));
         if let Some(area) = self.area {
@@ -999,11 +1119,14 @@ impl Net {
     }
 }
 
-/// What the cursor or a ping labels: the words and the point above the globe.
+/// What the cursor or a ping labels: the words, the point above the globe, and the
+/// opacity of the words and of the chip's ground.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Label {
     pub text: String,
     pub at: [f32; 2],
     pub alpha: f32,
+    pub ground: f32,
 }
 
 pub struct Frame {
@@ -1011,7 +1134,8 @@ pub struct Frame {
     pub segs: Vec<Seg>,
     /// Names `segs`; the painter uploads them when it changes.
     pub key: u64,
-    pub label: Option<Label>,
+    /// Name chips, each fading on its own, so one can fade out as the next fades in.
+    pub labels: Vec<Label>,
     /// The approval card, drawn through the panel host while it shows.
     pub card: Option<crate::panel::Frame>,
 }
@@ -1077,8 +1201,7 @@ impl Net {
         let lws = (1.6 * u).max(1.0);
         let mut globes = Vec::with_capacity(16);
         let mut segs = Vec::with_capacity(512);
-        let mut label = None;
-        let mut worker_label: Option<Label> = None;
+        let mut labels = Vec::new();
         // The middle of the card's braid, held or not, for its tether.
         let mut held_gap: Option<[f32; 2]> = None;
         let card_on = |g: &Globe, worker: Option<&str>| self.card.as_ref().is_some_and(|c| c.globe == g.id && c.worker.as_deref() == worker);
@@ -1111,6 +1234,8 @@ impl Net {
                 }
             }
 
+            // A worker's or reach's chip covers its session's.
+            let mut cover: f32 = 0.0;
             for (i, r) in g.tasks.iter().enumerate() {
                 if r.form <= 0.0 {
                     continue;
@@ -1131,9 +1256,10 @@ impl Net {
                 braid(&mut segs, from, to, 0.0, span, span < 1.0, p.a, &spec, &[], 0.0, area.u, r.age, g.seed + 101 * i as u32, reduced);
                 let secs = r.age + phase(g.seed + i as u32);
                 reach::end(&mut segs, &reach::End { kind: r.kind, from, to, form: r.form, secs, hover: r.hover, alpha: p.a, u: area.u, reduced });
-                if r.hover > 0.01 && r.form > 0.8 {
-                    let what = if r.kind == TaskKind::Monitor { "monitor" } else { "shell" };
-                    worker_label = Some(Label { text: format!("{} · {what} {}", g.label, r.label), at: [to[0], to[1] - 14.0 * sc], alpha: r.hover });
+                let show = r.hover * formed(r.form, 0.8);
+                cover = cover.max(show);
+                if show > 0.01 {
+                    r.words.push(&mut labels, r.words(&g.label), [to[0], to[1] - 14.0 * sc], show);
                 }
             }
 
@@ -1145,10 +1271,10 @@ impl Net {
                 if let Some(t) = w.ping {
                     ring(&mut segs, wp.c, wp.r + 6.0 * sc * g.scale, theme::BONE, 0.9 * ping_light(t, reduced), 1.4 * lws);
                 }
-                let show = w.hover.max(w.ping.map_or(0.0, |t| ((1.0 - t / PING_SECS) * 4.0).min(1.0)));
-                if show > 0.01 && w.form > 0.5 {
-                    let text = format!("{}·{} · {}", g.label, w.label, w.kind);
-                    worker_label = Some(Label { text, at: [wp.c[0], wp.c[1] - wp.r], alpha: show });
+                let show = w.show() * formed(w.form, 0.5);
+                cover = cover.max(show);
+                if show > 0.01 {
+                    w.words.push(&mut labels, w.words(&g.label), [wp.c[0], wp.c[1] - wp.r], show);
                 }
                 let wa = wp.a * w.form.sqrt();
                 let held = if g.asker.as_deref() == Some(&w.id) { g.hold } else { 0.0 };
@@ -1178,19 +1304,9 @@ impl Net {
                 }
             }
 
-            let show = g.hover.max(g.ping.map_or(0.0, |t| ((1.0 - t / PING_SECS) * 4.0).min(1.0)));
-            if worker_label.is_some() {
-                label = worker_label.take();
-                continue;
-            }
-            if show > 0.01 && g.form > 0.5 {
-                let state = if g.waiting { "waiting" } else if g.busy { "busy" } else { "idle" };
-                let workers = match g.workers.iter().filter(|w| !w.leaving).count() {
-                    0 => String::new(),
-                    1 => format!(" · {}", g.workers[0].kind),
-                    n => format!(" · {n} workers"),
-                };
-                label = Some(Label { text: format!("{} · {state}{workers}", g.label), at: [p.c[0], p.c[1] - p.r], alpha: show });
+            let show = g.show() * formed(g.form, 0.5) * (1.0 - cover);
+            if show > 0.01 {
+                g.words.push(&mut labels, g.words(), [p.c[0], p.c[1] - p.r], show);
             }
         }
         globes.truncate(crate::globes::MAX_GLOBES);
@@ -1223,7 +1339,7 @@ impl Net {
             };
             Some(approval::frame(&view))
         });
-        Some(Frame { globes, segs, key: std::hash::Hasher::finish(&h), label, card })
+        Some(Frame { globes, segs, key: std::hash::Hasher::finish(&h), labels, card })
     }
 }
 
@@ -1594,6 +1710,88 @@ mod tests {
         }
     }
 
+    /// The chip that shows most.
+    fn chip(f: &Frame) -> Option<Label> {
+        f.labels.iter().max_by(|a, b| a.alpha.total_cmp(&b.alpha)).cloned()
+    }
+
+    fn chip_of<'a>(f: &'a Frame, prefix: &str) -> Option<&'a Label> {
+        f.labels.iter().find(|l| l.text.starts_with(prefix))
+    }
+
+    #[test]
+    fn moving_between_globes_cross_fades_their_chips() {
+        let mut now = T0;
+        let mut n = net();
+        n.ingest_sessions(&[info("a", true, 0), info("b", true, 0)], now);
+        n.finish();
+        n.hover = Some("a".into());
+        run(&mut n, 1.0, &mut now);
+        assert_eq!(chip(&n.frame(&area(), false).unwrap()).unwrap().text, "a · busy");
+        n.hover = Some("b".into());
+        run(&mut n, 0.05, &mut now);
+        let f = n.frame(&area(), false).unwrap();
+        let (a, b) = (chip_of(&f, "a ·").unwrap(), chip_of(&f, "b ·").unwrap());
+        assert!(a.alpha > 0.05 && a.alpha < 0.95, "a fades out: {}", a.alpha);
+        assert!(b.alpha > 0.05 && b.alpha < 0.95, "b fades in: {}", b.alpha);
+        run(&mut n, 1.0, &mut now);
+        let f = n.frame(&area(), false).unwrap();
+        assert!(chip_of(&f, "a ·").is_none());
+        assert_eq!(chip_of(&f, "b ·").unwrap().alpha, 1.0);
+    }
+
+    #[test]
+    fn a_chip_whose_words_change_cross_fades_in_place() {
+        let mut now = T0;
+        let mut n = net();
+        n.ingest_sessions(&[info("a", true, 0)], now);
+        n.finish();
+        n.hover = Some("a".into());
+        run(&mut n, 1.0, &mut now);
+        n.ingest_sessions(&[info("a", false, 0)], now);
+        run(&mut n, 0.1, &mut now);
+        let f = n.frame(&area(), false).unwrap();
+        let old = f.labels.iter().find(|l| l.text == "a · busy").expect("old words still show");
+        let new = f.labels.iter().find(|l| l.text == "a · idle").expect("new words show");
+        assert_eq!(old.at, new.at, "in place");
+        assert!(old.alpha > 0.05 && old.alpha < 0.95, "old fades out: {}", old.alpha);
+        assert!(new.alpha > 0.05 && new.alpha < 0.95, "new fades in: {}", new.alpha);
+        assert_eq!(new.ground, 1.0, "the ground holds steady");
+        run(&mut n, 0.5, &mut now);
+        let f = n.frame(&area(), false).unwrap();
+        assert_eq!(f.labels.len(), 1);
+        assert_eq!(f.labels[0].text, "a · idle");
+    }
+
+    #[test]
+    fn a_pinged_chip_fades_in() {
+        let mut now = T0;
+        let mut n = net();
+        n.ingest_sessions(&[info("a", true, 0)], now);
+        n.finish();
+        n.ping("a", None);
+        assert!(n.frame(&area(), false).unwrap().labels.is_empty(), "nothing at once");
+        run(&mut n, 0.05, &mut now);
+        let a = chip(&n.frame(&area(), false).unwrap()).unwrap().alpha;
+        assert!(a > 0.0 && a < 0.95, "{a}");
+    }
+
+    #[test]
+    fn a_workers_chip_fades_its_sessions_out() {
+        let mut now = T0;
+        let mut n = net();
+        n.ingest_sessions(&[info("a", true, 1)], now);
+        n.finish();
+        n.hover = Some("a".into());
+        run(&mut n, 1.0, &mut now);
+        n.hover = Some("a-w0".into());
+        run(&mut n, 0.05, &mut now);
+        let f = n.frame(&area(), false).unwrap();
+        let (g, w) = (chip_of(&f, "a · ").unwrap(), chip_of(&f, "a·w1").unwrap());
+        assert!(g.alpha > 0.05 && g.alpha < 0.95, "session fades out: {}", g.alpha);
+        assert!(w.alpha > 0.05 && w.alpha < 0.95, "worker fades in: {}", w.alpha);
+    }
+
     fn get<'a>(n: &'a Net, id: &str) -> Option<&'a Globe> {
         n.globes.iter().find(|g| g.id == id)
     }
@@ -1832,7 +2030,7 @@ mod tests {
         assert_eq!(n.hit(&area(), wp.c[0], wp.c[1]), Some(id.clone()));
         n.hover = Some(id);
         run(&mut n, 1.0, &mut t);
-        let label = n.frame(&area(), false).unwrap().label.unwrap();
+        let label = chip(&n.frame(&area(), false).unwrap()).unwrap();
         assert!(label.text.starts_with("a·w1 · "), "{}", label.text);
     }
 
@@ -1846,7 +2044,7 @@ mod tests {
         assert!(n.globes[0].ping.is_none());
         assert!(n.globes[0].workers[1].ping.is_some() && n.globes[0].workers[0].ping.is_none());
         run(&mut n, 0.5, &mut now);
-        let label = n.frame(&area(), false).unwrap().label.unwrap();
+        let label = chip(&n.frame(&area(), false).unwrap()).unwrap();
         assert!(label.text.starts_with("a·w2"), "{}", label.text);
         // An unknown worker falls back to the session.
         n.ping("a", Some("gone"));
@@ -2093,7 +2291,7 @@ mod tests {
         assert_eq!(n.hit(&area(), to[0], to[1]).as_deref(), Some("a-t0"));
         n.hover = Some("a-t0".into());
         run(&mut n, 1.0, &mut now);
-        assert_eq!(n.frame(&area(), false).unwrap().label.unwrap().text, "a · monitor job0");
+        assert_eq!(chip(&n.frame(&area(), false).unwrap()).unwrap().text, "a · monitor job0");
     }
 
     #[test]

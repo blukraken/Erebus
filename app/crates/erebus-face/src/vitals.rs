@@ -25,6 +25,9 @@ const EASE_CORES: f32 = 0.22;
 const EASE_GPU: f32 = 0.5;
 const EASE_RAM: f32 = 0.4;
 const TEXT_EVERY: f64 = 0.5;
+/// The tooltip fades in over `TIP_IN` and out over `TIP_OUT`, seconds.
+const TIP_IN: f32 = 0.12;
+const TIP_OUT: f32 = 0.18;
 /// Seconds the braid spans.
 const SPAN: f32 = 60.0;
 /// Braid phase, radians per second; motes cross in 1 / (0.06 × (0.4 + 1.6 load)) s.
@@ -277,7 +280,13 @@ pub fn glow(x: f32, y: f32, size: f32, c: Rgb, alpha: f32) -> Seg {
     s
 }
 
-fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
+fn smooth(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// `a` blended toward `b` by `t`, 0..1.
+pub fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
     let t = t.clamp(0.0, 1.0);
     let ch = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t).round() as u8;
     Rgb(ch(a.0, b.0), ch(a.1, b.1), ch(a.2, b.2))
@@ -293,6 +302,8 @@ pub struct Frame {
     pub text: TextFrame,
     /// Each row's left rule `[x, y, w, h]` and colour.
     pub rules: [([f32; 4], Rgb); ROWS],
+    /// The tooltip's opacity, kept out of `text` so a fade does not lay it out again.
+    pub tip_alpha: f32,
 }
 
 /// Strings for each row and each row's tooltip, refreshed at most twice a second.
@@ -320,6 +331,9 @@ pub struct Vitals {
     text_at: Option<f64>,
     strings: Strings,
     pub hover: Option<Row>,
+    /// The row whose tooltip shows, kept while it fades out, and its opacity.
+    tip_row: Option<Row>,
+    tip_a: f32,
     generation: u64,
 }
 
@@ -360,6 +374,26 @@ impl Vitals {
     pub fn clear(&mut self) {
         let hover = self.hover;
         *self = Vitals { hover, generation: self.generation + 1, ..Default::default() };
+    }
+
+    /// The tooltip fades: toward the hovered row, or out before it moves to another.
+    pub fn busy(&self) -> bool {
+        self.has_data() && (self.tip_row != self.hover || self.tip_a < f32::from(u8::from(self.hover.is_some())))
+    }
+
+    /// Fades the tooltip in over `TIP_IN` and out over `TIP_OUT`. A move to another row fades
+    /// out first, so the words and place never jump.
+    fn step_tip(&mut self, dt: f32) {
+        if self.tip_row != self.hover && self.tip_a > 0.0 {
+            self.tip_a = (self.tip_a - dt / TIP_OUT).max(0.0);
+            if self.tip_a > 0.0 {
+                return;
+            }
+        }
+        self.tip_row = self.hover;
+        if self.hover.is_some() {
+            self.tip_a = (self.tip_a + dt / TIP_IN).min(1.0);
+        }
     }
 
     /// Takes a `Vitals` message. Samples at or before the newest held are replays and skipped.
@@ -422,6 +456,7 @@ impl Vitals {
             let u = f64::from(self.shown.util / 100.0).clamp(0.0, 1.0);
             self.stir = (self.stir + dt * (0.12 + 1.1 * u)) % std::f64::consts::TAU;
         }
+        self.step_tip(dt);
         self.clock += f64::from(dt);
         if self.text_at.is_none_or(|t| self.clock - t >= TEXT_EVERY) {
             self.text_at = Some(self.clock);
@@ -433,6 +468,8 @@ impl Vitals {
     pub fn snap(&mut self) {
         self.shown = self.target.clone();
         self.text_at = None;
+        self.tip_row = self.hover;
+        self.tip_a = f32::from(u8::from(self.hover.is_some()));
         self.step(0.0, true);
     }
 
@@ -573,7 +610,7 @@ impl Vitals {
                 RowText { left, top, spans: self.strings.rows[row as usize].clone() }
             })
             .to_vec();
-        let tip = self.hover.map(|row| TipText {
+        let tip = self.tip_row.filter(|_| self.tip_a > 0.0).map(|row| TipText {
             left: col.right + 10.0 * col.k,
             top: col.rows[row as usize].rect[1],
             lines: self.strings.tips[row as usize].clone(),
@@ -582,7 +619,8 @@ impl Vitals {
             let [x, y, _, h] = col.rows[row as usize].rect;
             ([x, y, 2.0 * col.px, h], row.color())
         });
-        Some(Frame { uniform, history, generation: self.generation, segs, text: TextFrame { rows, tip }, rules })
+        let tip_alpha = smooth(self.tip_a);
+        Some(Frame { uniform, history, generation: self.generation, segs, text: TextFrame { rows, tip }, tip_alpha, rules })
     }
 
     /// Settling reservoir: a rounded vessel filled with particles up to the share of RAM in
@@ -1151,6 +1189,40 @@ mod tests {
         assert!(column(700, 900, 1.0).is_none());
         assert_eq!(c.hit(100.0, c.rows[1].rect[1] + 5.0), Some(Row::Gpu));
         assert_eq!(c.hit(700.0, c.rows[1].rect[1] + 5.0), None);
+    }
+
+    #[test]
+    fn the_tooltip_fades_in_moves_by_fading_and_fades_out() {
+        let mut v = canned(0);
+        let col = column(5120, 1440, 1.0).unwrap();
+        let tip = |v: &Vitals| {
+            let f = v.frame(Some(&col), CANNED_T0 + 400, (5120, 1440), false).unwrap();
+            (f.text.tip.map(|t| t.top), f.tip_alpha)
+        };
+        let (gpu, cpu) = (col.rows[1].rect[1], col.rows[2].rect[1]);
+        v.hover = Some(Row::Gpu);
+        assert_eq!(tip(&v), (None, 0.0), "nothing at once");
+        assert!(v.busy());
+        v.step(0.05, false);
+        let (at, a) = tip(&v);
+        assert!(at == Some(gpu) && a > 0.05 && a < 0.95, "fading in: {a}");
+        v.step(0.2, false);
+        assert_eq!(tip(&v), (Some(gpu), 1.0));
+        assert!(!v.busy());
+        // To another row: the tip fades out where it is before it moves.
+        v.hover = Some(Row::Cpu);
+        v.step(0.05, false);
+        let (at, a) = tip(&v);
+        assert!(at == Some(gpu) && a > 0.05 && a < 0.95, "fading out in place: {a}");
+        v.step(0.5, false);
+        assert_eq!(tip(&v), (Some(cpu), 1.0));
+        v.hover = None;
+        v.step(0.05, false);
+        let (at, a) = tip(&v);
+        assert!(at == Some(cpu) && a > 0.05 && a < 0.95, "fading out: {a}");
+        v.step(0.5, false);
+        assert_eq!(tip(&v), (None, 0.0));
+        assert!(!v.busy());
     }
 
     #[test]

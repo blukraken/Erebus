@@ -218,7 +218,6 @@ struct App {
     state: StateLog,
     vitals: Vitals,
     panel: Panel,
-    collapse_hover: bool,
     feed: Feed,
     net: Net,
 }
@@ -280,7 +279,6 @@ pub fn run(opts: Options) -> Result<(), String> {
         state: StateLog { state: RenderState::Calm, since: now, frames: 0 },
         vitals: Vitals::default(),
         panel: Panel::default(),
-        collapse_hover: false,
         feed: Feed::new(),
         net: Net::new(),
     };
@@ -611,7 +609,7 @@ impl App {
 
     /// Animation frames are due: the knot moves, or a transition runs.
     fn animating(&self) -> bool {
-        self.state.state != RenderState::Suspended && (!self.reduced || self.sim.busy() || self.panel.busy() || self.feed.busy() || self.net.busy())
+        self.state.state != RenderState::Suspended && (!self.reduced || self.sim.busy() || self.vitals.busy() || self.panel.busy() || self.feed.busy() || self.net.busy())
     }
 
     /// Hover hit on the knot: inside 0.9 of its radius, as in the prototype.
@@ -809,7 +807,7 @@ impl App {
         self.redraw("vitals panel");
     }
 
-    /// Shows the hovered row's tooltip. A window that is not animating draws it at once.
+    /// Fades the hovered row's tooltip in, or out. The fade keeps frames coming while it runs.
     fn set_vital_hover(&mut self, row: Option<vitals::Row>) {
         if row == self.vitals.hover {
             return;
@@ -881,8 +879,8 @@ impl App {
         }
         let tip = if let Hit::Vital(r) = hit { (!self.panel.is_open()).then_some(r) } else { None };
         self.set_vital_hover(tip);
-        if (hit == Hit::Collapse) != self.collapse_hover {
-            self.collapse_hover = hit == Hit::Collapse;
+        if (hit == Hit::Collapse) != self.panel.collapse_hover {
+            self.panel.collapse_hover = hit == Hit::Collapse;
             self.redraw("collapse hover");
         }
         let over = hit == Hit::Close;
@@ -1039,9 +1037,13 @@ impl App {
             self.net.set_area(a);
         }
         let net = area.as_ref().and_then(|a| self.net.frame(a, self.reduced));
-        // A globe's name chip shares the file label's box when no file is hovered.
-        let globe_label = net.as_ref().and_then(|n| n.label.as_ref()).filter(|_| self.sim.hovered.is_none());
-        let panel = column.as_ref().and_then(|c| panel::frame(&self.panel, &self.vitals, c, (w, h), self.collapse_hover, self.reduced));
+        // Name chips give way to a hovered file's label, fading as it fades in.
+        let give = 1.0 - self.sim.file_hover();
+        let chips: Vec<net::Label> = net
+            .as_ref()
+            .map(|n| n.labels.iter().map(|l| net::Label { alpha: l.alpha * give, ground: l.ground * give, ..l.clone() }).collect())
+            .unwrap_or_default();
+        let panel = column.as_ref().and_then(|c| panel::frame(&self.panel, &self.vitals, c, (w, h), self.reduced));
         let feed = column.as_ref().and_then(|c| self.feed.frame(c, self.reduced));
         let scene = Scene {
             view,
@@ -1051,11 +1053,9 @@ impl App {
             label_alpha: self.sim.hover(),
             files: self.sim.files.instances(),
             files_gen: self.sim.files.generation,
-            file_label: match globe_label {
-                Some(l) => Some((l.text.as_str(), l.at)),
-                None => self.file_label.as_ref().map(|(p, at)| (p.as_str(), *at)),
-            },
-            file_label_alpha: globe_label.map_or(self.sim.file_hover(), |l| l.alpha),
+            file_label: self.file_label.as_ref().map(|(p, at)| (p.as_str(), *at)),
+            file_label_alpha: self.sim.file_hover(),
+            chips: &chips,
             more: more.as_deref(),
             vitals: vitals.as_ref(),
             // The approval card takes the panel's place while it shows.

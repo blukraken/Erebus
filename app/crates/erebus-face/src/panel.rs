@@ -51,6 +51,8 @@ const BODY_SIZE: f32 = 11.5;
 const ID_SIZE: f32 = 12.0;
 const TICK: f32 = 9.0;
 const TICK_OUT: f32 = 5.0;
+/// The collapse control brightens under the cursor over this long, seconds.
+const LIT: f32 = 0.12;
 
 /// Open state and how much of the panel is built.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -62,6 +64,9 @@ pub struct Panel {
     built: f32,
     /// Seconds of building or eating, for the swarm's motion.
     clock: f32,
+    /// The cursor is on "— collapse", and 0..1, how lit the control is.
+    pub collapse_hover: bool,
+    collapse_lit: f32,
 }
 
 impl Panel {
@@ -80,8 +85,13 @@ impl Panel {
     }
 
     /// It is being built or eaten.
-    pub fn busy(&self) -> bool {
+    fn building(&self) -> bool {
         if self.open { self.built < 1.0 } else { self.built > 0.0 }
+    }
+
+    /// It is being built or eaten, or the collapse control is fading.
+    pub fn busy(&self) -> bool {
+        self.building() || self.collapse_lit != f32::from(u8::from(self.collapse_hover))
     }
 
     /// A click on a vitals row: opens on it, moves to it, or closes when already on it.
@@ -100,9 +110,11 @@ impl Panel {
 
     pub fn step(&mut self, dt: f32, reduced: bool) {
         let dt = dt.max(0.0);
-        if self.busy() {
+        if self.building() {
             self.clock += dt;
         }
+        let lit = f32::from(u8::from(self.collapse_hover));
+        self.collapse_lit = if lit > self.collapse_lit { (self.collapse_lit + dt / LIT).min(lit) } else { (self.collapse_lit - dt / LIT).max(lit) };
         self.built = if self.open {
             (self.built + dt / if reduced { REDUCED } else { BUILD }).min(1.0)
         } else {
@@ -382,7 +394,7 @@ fn nanites(out: &mut Vec<Seg>, [x, y, w, h]: [f32; 4], front: f32, src: [f32; 2]
 }
 
 /// Builds the vitals panel, or `None` when nothing of it shows.
-pub fn frame(p: &Panel, v: &Vitals, col: &Column, size: (u32, u32), collapse_hover: bool, reduced: bool) -> Option<Frame> {
+pub fn frame(p: &Panel, v: &Vitals, col: &Column, size: (u32, u32), reduced: bool) -> Option<Frame> {
     if !p.visible() {
         return None;
     }
@@ -399,11 +411,11 @@ pub fn frame(p: &Panel, v: &Vitals, col: &Column, size: (u32, u32), collapse_hov
 
     // Reduced motion fades the whole panel; otherwise the front cuts it.
     let (fa, front) = if reduced { (p.built, f32::MAX) } else { (1.0, x + p.built * w) };
-    let working = !reduced && p.busy();
+    let working = !reduced && p.building();
 
     let mut key = DefaultHasher::new();
     (v.generation(), l.rect.map(f32::to_bits), p.built.to_bits(), p.clock.to_bits()).hash(&mut key);
-    (row as u8, p.open, collapse_hover, reduced).hash(&mut key);
+    (row as u8, p.open, p.collapse_lit.to_bits(), reduced).hash(&mut key);
 
     let mut rects = Vec::with_capacity(32);
     let mut push = |r: [f32; 4], c: Rgb, a: f32| {
@@ -450,7 +462,8 @@ pub fn frame(p: &Panel, v: &Vitals, col: &Column, size: (u32, u32), collapse_hov
     let (bs, is) = (BODY_SIZE, ID_SIZE);
     items.push(Item { bold: true, mono: false, ..item(x + 12.0 * k, y + 7.0 * k, is, "Vitals".into(), theme::BONE) });
     items.push(item(x + 56.0 * k, y + 7.5 * k, bs, "last 90 s · sampled 1 s".into(), vitals::LABEL));
-    let collapse_color = if collapse_hover { theme::BONE } else { vitals::LABEL };
+    let lit = p.collapse_lit;
+    let collapse_color = vitals::mix(vitals::LABEL, theme::BONE, lit * lit * (3.0 - 2.0 * lit));
     items.push(Item { right: true, ..item(x + w - 14.0 * k, y + 7.5 * k, bs, "— collapse".into(), collapse_color) });
 
     let bx = x + PAD_X * k;
@@ -619,7 +632,7 @@ mod tests {
         let mut p = Panel::default();
         p.toggle(Row::Gpu);
         p.step(BUILD * 0.5, false);
-        let f = frame(&p, &v, &col(), (5120, 1440), false, false).unwrap();
+        let f = frame(&p, &v, &col(), (5120, 1440), false).unwrap();
         let [x, _, w, _] = layout(&col(), 32, (5120, 1440)).rect;
         assert!((f.clip - (x + 0.5 * w)).abs() < 1.0);
         assert_eq!(f.alpha, 1.0, "no fade: text shows as the front passes it");
@@ -642,7 +655,7 @@ mod tests {
     #[test]
     fn frame_has_every_measure_and_core() {
         let v = vitals::canned(0);
-        let f = frame(&open(Row::Cpu), &v, &col(), (5120, 1440), false, false).unwrap();
+        let f = frame(&open(Row::Cpu), &v, &col(), (5120, 1440), false).unwrap();
         let words: Vec<&str> = f.text.items.iter().map(|i| i.text.as_str()).collect();
         for w in ["RAM", "GPU util", "VRAM", "GPU temp", "CPU", "c00", "c31"] {
             assert!(words.contains(&w), "{w} missing");
@@ -658,7 +671,7 @@ mod tests {
         let mut s = vitals::canned_sample(1);
         s.gpu = None;
         v.ingest(erebus_protocol::Vitals { hw: vitals::canned_hw(), samples: vec![s] });
-        let f = frame(&open(Row::Gpu), &v, &col(), (5120, 1440), false, false).unwrap();
+        let f = frame(&open(Row::Gpu), &v, &col(), (5120, 1440), false).unwrap();
         // The newest sample has no GPU: util, VRAM and temp each lose one stroke.
         assert_eq!(f.segs.len(), 34 + (5 + 32) * 90 - 3);
         let words: Vec<&str> = f.text.items.iter().map(|i| i.text.as_str()).collect();
@@ -666,8 +679,27 @@ mod tests {
     }
 
     #[test]
+    fn the_collapse_control_brightens_gradually() {
+        let v = vitals::canned(0);
+        let mut p = open(Row::Cpu);
+        let color = |p: &Panel| frame(p, &v, &col(), (5120, 1440), false).unwrap().text.items.iter().find(|i| i.text == "— collapse").unwrap().color;
+        assert_eq!(color(&p), vitals::LABEL);
+        p.collapse_hover = true;
+        assert!(p.busy());
+        p.step(0.05, false);
+        let c = color(&p);
+        assert!(c != vitals::LABEL && c != theme::BONE, "between: {c:?}");
+        p.step(0.2, false);
+        assert_eq!(color(&p), theme::BONE);
+        assert!(!p.busy());
+        p.collapse_hover = false;
+        p.step(0.05, false);
+        assert!(color(&p) != theme::BONE, "and dims again gradually");
+    }
+
+    #[test]
     fn a_closed_panel_draws_nothing() {
         let v = vitals::canned(0);
-        assert!(frame(&Panel::default(), &v, &col(), (5120, 1440), false, false).is_none());
+        assert!(frame(&Panel::default(), &v, &col(), (5120, 1440), false).is_none());
     }
 }

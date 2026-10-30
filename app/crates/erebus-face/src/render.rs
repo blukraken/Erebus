@@ -62,6 +62,8 @@ pub struct Scene<'a> {
     /// A hovered file's path, the glyph centre it labels, and its fade.
     pub file_label: Option<(&'a str, [f32; 2])>,
     pub file_label_alpha: f32,
+    /// Globe, worker and reach name chips, in the file label's box, each with its own fade.
+    pub chips: &'a [net::Label],
     /// `+N` for files the core counts but does not list.
     pub more: Option<&'a str>,
     /// The vitals stack, when there are readings.
@@ -306,13 +308,16 @@ struct TextKey {
     label: Option<String>,
     /// File path and its glyph centre, whole pixels.
     file_label: Option<(String, i32, i32)>,
+    /// Name chips' words and anchors, whole pixels.
+    chips: Vec<(String, i32, i32)>,
     more: Option<String>,
 }
 
 #[derive(PartialEq)]
 struct Prepared {
     palette: bool,
-    fades: [u8; 3],
+    fades: [u8; 4],
+    chip_fades: Vec<u8>,
     /// Panel front, whole pixels.
     clip: i32,
     key: TextKey,
@@ -320,7 +325,7 @@ struct Prepared {
     panel: Option<panel::Text>,
     /// Feed rows by id, with their tops and fades; the live chip's words, tint and fade.
     feed: Vec<(u64, i32, u8)>,
-    chip: Option<(String, u8, u8)>,
+    chip: Option<(String, Rgb, u8)>,
 }
 
 struct Text {
@@ -352,6 +357,7 @@ struct Text {
     /// Hover labels and their boxes `[x, y, w, h]`.
     label: Option<(Placed, [f32; 4])>,
     file_label: Option<(Placed, [f32; 4])>,
+    chips: Vec<(Placed, [f32; 4])>,
     more: Option<Placed>,
     cells: Vec<Placed>,
 }
@@ -434,6 +440,7 @@ impl Text {
             wordmark: None,
             label: None,
             file_label: None,
+            chips: Vec::new(),
             more: None,
             cells: Vec::new(),
         }
@@ -485,20 +492,23 @@ impl Text {
             (Placed { buf, left, top, color: theme::BONE_2, bounds: b }, [bx, by, bw, bh])
         });
 
-        // File label: the same mono box, centred above the hovered glyph, kept on screen.
-        self.file_label = key.file_label.as_ref().map(|(text, gx, gy)| {
-            let buf = line(fonts, text, 12.5 * k, self.mono, Weight::NORMAL, 0.02, None);
+        // File label and name chips: the same mono box, centred above the point, kept on screen.
+        let mono = self.mono;
+        let mut point_box = |text: &str, gx: i32, gy: i32| {
+            let buf = line(fonts, text, 12.5 * k, mono, Weight::NORMAL, 0.02, None);
             let w = buf.layout_runs().map(|r| r.line_w).fold(0.0, f32::max);
             let (px, py) = (7.0 * k, 3.0 * k);
             let bw = (w + 2.0 * px).round();
             let bh = (height(&buf) + 2.0 * py).round();
-            let bx = (*gx as f32 - bw * 0.5).clamp(l.pad, (l.w - l.pad - bw).max(l.pad)).round();
-            let above = *gy as f32 - 16.0 * k - bh;
-            let by = if above > 48.0 * k { above } else { *gy as f32 + 16.0 * k }.round();
+            let bx = (gx as f32 - bw * 0.5).clamp(l.pad, (l.w - l.pad - bw).max(l.pad)).round();
+            let above = gy as f32 - 16.0 * k - bh;
+            let by = if above > 48.0 * k { above } else { gy as f32 + 16.0 * k }.round();
             let (left, top) = (bx + px, by + py);
             let b = bounds(left, top, left + w + 1.0, top + height(&buf));
             (Placed { buf, left, top, color: theme::BONE, bounds: b }, [bx, by, bw, bh])
-        });
+        };
+        self.file_label = key.file_label.as_ref().map(|(text, gx, gy)| point_box(text, *gx, *gy));
+        self.chips = key.chips.iter().map(|(text, gx, gy)| point_box(text, *gx, *gy)).collect();
 
         // `+N`: small mono text low and right of the knot.
         self.more = key.more.as_deref().map(|text| {
@@ -649,7 +659,7 @@ impl Text {
             .collect();
         self.feed_chip = f.chip.as_ref().map(|c| {
             let [cx, cy, cw, ch] = l.chip();
-            let color = if c.hover { theme::BONE } else { theme::BONE_2 };
+            let color = vitals::mix(theme::BONE_2, theme::BONE, c.hover);
             let buf = match self.feed_chip.take() {
                 Some((t, p, _)) if t == c.text => p.buf,
                 _ => line(fonts, &c.text, feed::CHIP_SIZE * l.k, self.mono, Weight::NORMAL, 0.02, None),
@@ -695,7 +705,8 @@ impl Text {
     }
 
     /// Prepares text when anything shown changed. Returns whether it did. `fades` are the
-    /// knot label's, the file label's and the panel's; panel text right of `clip` is cut.
+    /// knot label's, the file label's, the panel's and the vitals tooltip's; panel text right
+    /// of `clip` is cut.
     #[allow(clippy::too_many_arguments)]
     fn prepare(
         &mut self,
@@ -704,7 +715,8 @@ impl Text {
         w: u32,
         h: u32,
         palette: bool,
-        fades: [f32; 3],
+        fades: [f32; 4],
+        chip_fades: &[f32],
         clip: f32,
     ) -> bool {
         let clip = clip.min(w as f32).round() as i32;
@@ -713,13 +725,14 @@ impl Text {
         let Some(key) = self.key.clone() else { return false };
         let state = Prepared {
             palette,
-            fades: [fade, file_fade, panel_fade],
+            fades: [fade, file_fade, panel_fade, byte(fades[3])],
+            chip_fades: chip_fades.iter().map(|&a| byte(a)).collect(),
             clip,
             key,
             vitals: self.vitals_key.as_ref().map(|(t, _)| t.clone()),
             panel: self.panel_key.clone(),
             feed: self.feed.iter().map(|(id, c, _, a)| (*id, c.top as i32, byte(*a))).collect(),
-            chip: self.feed_chip.as_ref().map(|(t, p, a)| (t.clone(), p.color.0, byte(*a))),
+            chip: self.feed_chip.as_ref().map(|(t, p, a)| (t.clone(), p.color, byte(*a))),
         };
         if self.prepared.as_ref() == Some(&state) {
             return false;
@@ -733,9 +746,12 @@ impl Text {
         if let Some((p, _)) = self.file_label.as_ref().filter(|_| file_fade > 0) {
             areas.push(p.area_alpha(fades[1]));
         }
+        for ((p, _), &a) in self.chips.iter().zip(chip_fades).filter(|(_, a)| byte(**a) > 0) {
+            areas.push(p.area_alpha(a));
+        }
         areas.extend(self.more.iter().map(Placed::area));
         areas.extend(self.vitals_rows.iter().map(Placed::area));
-        areas.extend(self.vitals_tip.iter().map(|(p, _)| p.area()));
+        areas.extend(self.vitals_tip.iter().map(|(p, _)| p.area_alpha(fades[3])));
         for (_, clock, phrase, a) in &self.feed {
             areas.push(clock.area_alpha(*a));
             areas.push(phrase.area_alpha(*a));
@@ -1038,6 +1054,7 @@ impl Renderer {
             crumbs: scene.crumbs.iter().map(|c| c.to_string()).collect(),
             label: scene.label.map(str::to_string),
             file_label: scene.file_label.map(|(p, [x, y])| (p.to_string(), x.round() as i32, y.round() as i32)),
+            chips: scene.chips.iter().map(|c| (c.text.clone(), c.at[0].round() as i32, c.at[1].round() as i32)).collect(),
             more: scene.more.map(str::to_string),
         };
         self.text.layout(&l, key, scene.knot.radius());
@@ -1061,8 +1078,9 @@ impl Renderer {
             // Left rules at .9, as the prototype's `--fc`.
             extra.extend(v.rules.iter().map(|&([x, y, w, h], c)| rgba_rect(x, y, w, h, c, 0.9)));
             if let Some((_, [x, y, w, h])) = self.text.vitals_tip {
-                extra.push(rect(x, y, w, h, theme::RULE_2));
-                extra.push(rect(x + l.hair, y + l.hair, w - 2.0 * l.hair, h - 2.0 * l.hair, vitals::TIP_GROUND));
+                let a = v.tip_alpha;
+                extra.push(rgba_rect(x, y, w, h, theme::RULE_2, a));
+                extra.push(rgba_rect(x + l.hair, y + l.hair, w - 2.0 * l.hair, h - 2.0 * l.hair, vitals::TIP_GROUND, a));
             }
         }
         if let Some(p) = scene.panel {
@@ -1072,14 +1090,17 @@ impl Renderer {
         let mut labels = Vec::with_capacity(2);
         labels.extend(self.text.label.as_ref().map(|(_, b)| (*b, scene.label_alpha)));
         labels.extend(self.text.file_label.as_ref().map(|(_, b)| (*b, scene.file_label_alpha)));
+        labels.extend(self.text.chips.iter().zip(scene.chips).map(|((_, b), c)| (*b, c.ground)));
         let shapes = shapes(&l, scene.view, self.text.strip_h, &labels, &extra);
         if shapes != self.last_shapes {
             queue.write_buffer(&self.shapes, 0, bytemuck::cast_slice(&shapes));
         }
 
         let (panel_alpha, clip) = scene.panel.map_or((0.0, f32::MAX), |p| (p.alpha, p.clip));
-        let fades = [scene.label_alpha, scene.file_label_alpha, panel_alpha];
-        if self.text.prepare(device, queue, w, h, scene.view.palette, fades, clip) {
+        let tip_alpha = scene.vitals.map_or(0.0, |v| v.tip_alpha);
+        let fades = [scene.label_alpha, scene.file_label_alpha, panel_alpha, tip_alpha];
+        let chip_fades: Vec<f32> = scene.chips.iter().map(|c| c.alpha).collect();
+        if self.text.prepare(device, queue, w, h, scene.view.palette, fades, &chip_fades, clip) {
             self.trimmed = false;
         }
         let n = shapes.len() as u32;

@@ -255,7 +255,7 @@ pub fn run(shot: &Shot) -> Result<(), String> {
     if let Some(row) = k.vitals_panel {
         vpanel.toggle(row);
     }
-    let panel_frame = |p: &Panel, vt: &Vitals| panel::frame(p, vt, column.as_ref()?, (w, h), false, k.reduced);
+    let panel_frame = |p: &Panel, vt: &Vitals| panel::frame(p, vt, column.as_ref()?, (w, h), k.reduced);
     let mut feed = Feed::new();
     let mut held: Vec<erebus_protocol::FeedEvent> = k.feed.clone().unwrap_or_default();
     let hold = if shot.frames.is_some() { held.len().min(3) } else { 0 };
@@ -297,6 +297,8 @@ pub fn run(shot: &Shot) -> Result<(), String> {
     let mut renderer = Renderer::new(&gpu.device, &gpu.queue, format);
     let Some(frames) = &shot.frames else {
         vpanel.snap();
+        // A still has no time for history to fade in.
+        feed.snap();
         // A still has no time to condense in, so its globes are shown fully formed.
         vnet.finish();
         let vf = vt.frame(column.as_ref(), now_ms, (w, h), k.reduced);
@@ -315,6 +317,7 @@ pub fn run(shot: &Shot) -> Result<(), String> {
             files_gen: sim.files.generation,
             file_label,
             file_label_alpha: sim.file_hover(),
+            chips: &[],
             more: more.as_deref(),
             vitals: vf.as_ref(),
             panel: nf.as_ref().and_then(|n| n.card.as_ref()).or(pf.as_ref()),
@@ -408,6 +411,7 @@ pub fn run(shot: &Shot) -> Result<(), String> {
             files_gen: sim.files.generation,
             file_label: file_label(&sim, k, centre, r),
             file_label_alpha: sim.file_hover(),
+            chips: &[],
             more: more.as_deref(),
             vitals: vf.as_ref(),
             panel: nf.as_ref().and_then(|n| n.card.as_ref()).or(pf.as_ref()),
