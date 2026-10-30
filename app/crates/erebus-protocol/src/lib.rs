@@ -76,6 +76,16 @@ pub struct SessionInfo {
     /// Background shells and monitors the session runs, oldest first.
     #[serde(default)]
     pub tasks: Vec<TaskInfo>,
+    /// How the last shown permission prompt was answered, for a few seconds after.
+    #[serde(default)]
+    pub decided: Option<Decided>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Decided {
+    pub tool_use_id: String,
+    pub granted: bool,
+    pub unix_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,6 +133,9 @@ pub struct Pending {
     /// The worker that asked, or `None` for the session itself.
     pub worker: Option<String>,
     pub since_unix_ms: u64,
+    /// What the call asks to do, on one line: the command, the file or the host.
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -367,14 +380,17 @@ mod tests {
             status: SessionStatus::Busy,
             started_unix_ms: 1_000,
             workers: vec![WorkerInfo { id: "a2f6".into(), label: "w1".into(), kind: "Explore".into(), started_unix_ms: 2_000 }],
-            pending: Some(Pending { tool_use_id: "toolu_1".into(), tool: "Bash".into(), worker: None, since_unix_ms: 3_000 }),
+            pending: Some(Pending { tool_use_id: "toolu_1".into(), tool: "Bash".into(), worker: None, since_unix_ms: 3_000, summary: Some("cargo test".into()) }),
+            decided: Some(Decided { tool_use_id: "toolu_0".into(), granted: false, unix_ms: 2_900 }),
             tasks: vec![TaskInfo { id: "toolu_2".into(), kind: TaskKind::Monitor, label: "build log".into(), started_unix_ms: 2_500 }],
         };
         // A snapshot from before tasks still reads, with none.
         let mut old = serde_json::to_value(&session).unwrap();
         old.as_object_mut().unwrap().remove("tasks");
+        old.as_object_mut().unwrap().remove("decided");
+        old["pending"].as_object_mut().unwrap().remove("summary");
         let back: SessionInfo = serde_json::from_value(old).unwrap();
-        assert!(back.tasks.is_empty());
+        assert!(back.tasks.is_empty() && back.decided.is_none() && back.pending.unwrap().summary.is_none());
         let event = FeedEvent {
             unix_ms: 4_000,
             kind: FeedKind::Tool,

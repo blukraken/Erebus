@@ -14,11 +14,12 @@
 //!
 //! Positions are in knot radii from the knot's centre, so the layout follows any window size.
 
+use crate::approval;
 use crate::codex;
 use crate::reach;
 use crate::globes::GlobeInst;
 use crate::vitals::{self, Seg};
-use erebus_protocol::{FeedEvent, SessionInfo, SessionStatus, TaskKind};
+use erebus_protocol::{FeedEvent, Pending, SessionInfo, SessionStatus, TaskKind};
 use erebus_theme::{self as theme, Rgb};
 use std::collections::VecDeque;
 use std::f32::consts::{PI, TAU};
@@ -55,6 +56,17 @@ const PULSE_TAIL: f32 = 110.0;
 const REACH_GROW: f32 = 1.2;
 const REACH_UNRAVEL: f32 = 1.5;
 const REACH_LEN: f32 = 1.4;
+
+/// A permission ask holds its braid over this long, and lets go as long, seconds; the card
+/// unfolds over `CARD_OPEN`, shows the verdict for `VERDICT_SECS`, then folds.
+const HOLD_SECS: f32 = 0.6;
+const CARD_OPEN: f32 = 0.42;
+const VERDICT_SECS: f32 = 2.6;
+/// While an ask holds the network, everything else dims to this, easing with `FOCUS_TAU`.
+const FOCUS_DIM: f32 = 0.26;
+const FOCUS_TAU: f32 = 0.25;
+/// The held gap's half length, as a share of the braid.
+const GAP_HALF: f32 = 0.07;
 
 /// Workers glide to new places in the fan with this time constant, seconds.
 const FAN_TAU: f32 = 0.7;
@@ -234,6 +246,8 @@ struct Worker {
     /// Seconds since a feed click pinged it, while the ping lasts.
     ping: Option<f32>,
     pulses: Pulses,
+    /// Seconds of twist on its braid, held still while it waits on a person.
+    twist: f32,
     /// 0..1 along the glide out of the parent's nucleus, linear in time.
     emerge: f32,
     form: f32,
@@ -278,6 +292,15 @@ struct Globe {
     ended_near: bool,
     pulses: Pulses,
     tasks: Vec<Reach>,
+    cwd: String,
+    /// The permission prompt waiting on a person, as the core reports it.
+    pending: Option<Pending>,
+    /// 0..1: how held its braid is (the asker's: the session's own, or a worker's).
+    hold: f32,
+    /// The worker that asked, or none for the session; kept while the hold lets go.
+    asker: Option<String>,
+    /// The last verdict seen, so each one pulses once.
+    decided: Option<String>,
 }
 
 /// The network area in physical pixels.
@@ -290,13 +313,15 @@ pub struct Area {
     pub u: f32,
     pub knot: [f32; 2],
     pub knot_r: f32,
+    /// Physical pixels per CSS pixel times the type scale, for text the network draws.
+    pub k: f32,
 }
 
 impl Area {
     /// Right of the feed column, inside the window's padding.
     pub fn new(col: &vitals::Column, w: u32, h: u32, knot_r: f32) -> Area {
         let x0 = col.right + 24.0 * col.u;
-        Area { x: [x0, w as f32 - 14.0 * col.k], band: col.band, u: col.u, knot: [w as f32 * 0.5, h as f32 * 0.5], knot_r }
+        Area { x: [x0, w as f32 - 14.0 * col.k], band: col.band, u: col.u, knot: [w as f32 * 0.5, h as f32 * 0.5], knot_r, k: col.k }
     }
 
     fn px(&self, p: [f32; 2]) -> [f32; 2] {
@@ -323,6 +348,28 @@ pub struct Net {
     /// The area of the last frame; motion waits for one.
     area: Option<Area>,
     pub hover: Option<String>,
+    /// The approval card, while one shows, and how much the rest of the network is dimmed.
+    card: Option<Card>,
+    focus: f32,
+    /// Wall time at the last step, milliseconds.
+    now_ms: u64,
+}
+
+/// The approval card: the globe and call it belongs to, what it says, and how far along.
+#[derive(Clone, Debug)]
+struct Card {
+    globe: String,
+    /// The worker that asked, or none for the session; the card stays on its braid.
+    worker: Option<String>,
+    /// Where the card sits, fixed by the braid's middle on its first frame.
+    at: std::cell::Cell<Option<[f32; 2]>>,
+    tool_use_id: String,
+    card: approval::Card,
+    open: f32,
+    verdict: Option<bool>,
+    /// Seconds since the verdict came.
+    shown: f32,
+    closing: bool,
 }
 
 fn hash(s: &str) -> u32 {
@@ -470,6 +517,11 @@ impl Net {
                         ended_near: false,
                         pulses: Pulses::default(),
                         tasks: Vec::new(),
+                        cwd: String::new(),
+                        pending: None,
+                        hold: 0.0,
+                        asker: None,
+                        decided: None,
                     };
                     g.p = g.anchor(self.clock, true);
                     self.globes.push(g);
@@ -478,6 +530,28 @@ impl Net {
             };
             let g = &mut self.globes[i];
             g.label.clone_from(&s.label);
+            g.cwd.clone_from(&s.cwd);
+            g.pending.clone_from(&s.pending);
+            if let Some(p) = &s.pending {
+                g.asker.clone_from(&p.worker);
+            }
+            if let Some(d) = s.decided.as_ref().filter(|d| g.decided.as_deref() != Some(&d.tool_use_id)) {
+                g.decided = Some(d.tool_use_id.clone());
+                // The answer runs home along the asker's braid: green for yes, red for no.
+                let col = if d.granted { theme::VERD } else { theme::VERM };
+                let worker = g.asker.as_ref().and_then(|id| g.workers.iter_mut().find(|w| &w.id == id));
+                match worker {
+                    Some(w) => {
+                        w.pulses.push(col);
+                    }
+                    None => {
+                        g.pulses.push(col);
+                    }
+                }
+                if let Some(c) = self.card.as_mut().filter(|c| c.tool_use_id == d.tool_use_id) {
+                    c.verdict = Some(d.granted);
+                }
+            }
             g.busy = busy;
             g.waiting = waiting;
             if busy {
@@ -485,7 +559,7 @@ impl Net {
             }
             for w in &s.workers {
                 if !g.workers.iter().any(|x| x.id == w.id && !x.leaving) {
-                    g.workers.push(Worker { id: w.id.clone(), label: w.label.clone(), kind: w.kind.clone(), hover: 0.0, ang: f32::NAN, ping: None, pulses: Pulses::default(), emerge: 0.0, form: 0.0, leaving: false });
+                    g.workers.push(Worker { id: w.id.clone(), label: w.label.clone(), kind: w.kind.clone(), hover: 0.0, ang: f32::NAN, ping: None, pulses: Pulses::default(), twist: g.twist, emerge: 0.0, form: 0.0, leaving: false });
                 }
             }
             for x in &mut g.workers {
@@ -547,6 +621,59 @@ impl Net {
         }
     }
 
+    /// The approval card follows the oldest ask: it unfolds, shows the verdict, then folds;
+    /// an ask that vanishes unanswered folds it at once. The rest of the network dims while
+    /// it shows.
+    fn step_card(&mut self, dt: f32, reduced: bool) {
+        let quick = |secs: f32| if reduced { REDUCED } else { secs };
+        if self.card.is_none() {
+            let oldest = self
+                .globes
+                .iter()
+                .filter(|g| g.form > 0.5 && g.phase != Phase::Dissolving)
+                .filter_map(|g| g.pending.as_ref().map(|p| (p.since_unix_ms, g, p)))
+                .min_by_key(|(t, g, _)| (*t, g.id.clone()));
+            if let Some((_, g, p)) = oldest {
+                let worker = p.worker.as_ref().and_then(|id| g.workers.iter().find(|w| &w.id == id));
+                self.card = Some(Card {
+                    globe: g.id.clone(),
+                    worker: p.worker.clone(),
+                    at: std::cell::Cell::new(None),
+                    tool_use_id: p.tool_use_id.clone(),
+                    card: approval::Card {
+                        who: worker.map_or_else(|| g.label.clone(), |w| format!("{}·{}", g.label, w.label)),
+                        tool: p.tool.clone(),
+                        summary: p.summary.clone(),
+                        since_ms: p.since_unix_ms,
+                    },
+                    open: 0.0,
+                    verdict: None,
+                    shown: 0.0,
+                    closing: false,
+                });
+            }
+        }
+        if let Some(c) = &mut self.card {
+            let still = self.globes.iter().find(|g| g.id == c.globe).and_then(|g| g.pending.as_ref()).is_some_and(|p| p.tool_use_id == c.tool_use_id);
+            if c.verdict.is_some() {
+                c.shown += dt;
+                c.closing |= c.shown >= quick(VERDICT_SECS);
+            } else if !still {
+                c.closing = true;
+            }
+            let step = dt / quick(CARD_OPEN);
+            c.open = if c.closing { (c.open - step).max(0.0) } else { (c.open + step).min(1.0) };
+            if c.closing && c.open <= 0.0 {
+                self.card = None;
+            }
+        }
+        let target = if self.card.as_ref().is_some_and(|c| !c.closing) { 1.0 } else { 0.0 };
+        self.focus = if reduced { target } else { self.focus + (target - self.focus) * (1.0 - (-dt / FOCUS_TAU).exp()) };
+        if (target - self.focus).abs() < 0.001 {
+            self.focus = target;
+        }
+    }
+
     /// Feed events are signs of work: they keep a session from being let go.
     pub fn note_activity(&mut self, events: &[FeedEvent]) {
         for e in events {
@@ -576,7 +703,7 @@ impl Net {
 
     /// A move, fade or ping runs. The spin and the slow sway ride the knot's own frames.
     pub fn busy(&self) -> bool {
-        self.globes.iter().any(|g| {
+        self.card.is_some() || self.focus > 0.0 || self.globes.iter().any(|g| {
             matches!(g.phase, Phase::Pulling | Phase::Releasing | Phase::Dissolving)
                 || g.form < 1.0
                 || len(g.v) > 0.01
@@ -584,6 +711,7 @@ impl Net {
                 || g.ping.is_some()
                 || g.workers.iter().any(|w| w.ping.is_some() || w.pulses.busy())
                 || g.pulses.busy()
+                || g.hold > 0.0
                 || g.tasks.iter().any(|r| r.leaving || r.form < 1.0)
                 || (g.hover - if self.hover.as_deref() == Some(&g.id) { 1.0 } else { 0.0 }).abs() > 0.001
                 || g.workers.iter().any(|w| (w.hover - if self.hover.as_deref() == Some(&w.id) { 1.0 } else { 0.0 }).abs() > 0.001)
@@ -611,8 +739,20 @@ impl Net {
         for g in &mut self.globes {
             g.t += dt;
             if !reduced {
-                g.twist += dt * TWIST_PACE * (1.0 - (1.0 - WAIT_TWIST) * g.wait);
+                // A held session braid stops still; a worker's ask only slows its parent's.
+                let held = g.hold * if g.asker.is_none() { 1.0 } else { 0.4 };
+                g.twist += dt * TWIST_PACE * (1.0 - (1.0 - WAIT_TWIST) * g.wait) * (1.0 - held);
+                for w in &mut g.workers {
+                    let held = if g.asker.as_deref() == Some(&w.id) { g.hold } else { 0.0 };
+                    w.twist += dt * TWIST_PACE * (1.0 - held);
+                }
                 g.age += dt;
+            }
+            let target = if g.pending.is_some() { 1.0 } else { 0.0 };
+            let step = dt / quick(HOLD_SECS);
+            g.hold = if target > g.hold { (g.hold + step).min(target) } else { (g.hold - step).max(target) };
+            if g.hold <= 0.0 && g.pending.is_none() {
+                g.asker = None;
             }
             let w = if g.waiting { 1.0 } else { 0.0 };
             g.wait += (w - g.wait) * ease(WAIT_TAU);
@@ -704,6 +844,8 @@ impl Net {
         if let Some(area) = self.area {
             self.physics(dt, reduced, &area);
         }
+        self.now_ms = now_ms;
+        self.step_card(dt, reduced);
         // Arrival and departure follow the bodies.
         let clock = self.clock;
         for g in &mut self.globes {
@@ -870,6 +1012,8 @@ pub struct Frame {
     /// Names `segs`; the painter uploads them when it changes.
     pub key: u64,
     pub label: Option<Label>,
+    /// The approval card, drawn through the panel host while it shows.
+    pub card: Option<crate::panel::Frame>,
 }
 
 /// One globe's drawn place and size in pixels.
@@ -883,7 +1027,11 @@ impl Net {
     fn place(&self, g: &Globe, area: &Area) -> Placed {
         let size = if g.headless { HEADLESS_SIZE } else { 1.0 };
         let r = SESSION_R * area.knot_r * g.scale * size * (1.0 + (HOVER_GROW - 1.0) * g.hover);
-        Placed { c: area.px(g.p), r, a: g.dim }
+        let dim = match &self.card {
+            Some(c) if c.globe != g.id => 1.0 + (FOCUS_DIM - 1.0) * self.focus,
+            _ => 1.0,
+        };
+        Placed { c: area.px(g.p), r, a: g.dim * dim }
     }
 
     /// A worker at angle `ang`, `e` of the way along its eased glide from the parent's centre
@@ -931,6 +1079,9 @@ impl Net {
         let mut segs = Vec::with_capacity(512);
         let mut label = None;
         let mut worker_label: Option<Label> = None;
+        // The middle of the card's braid, held or not, for its tether.
+        let mut held_gap: Option<[f32; 2]> = None;
+        let card_on = |g: &Globe, worker: Option<&str>| self.card.as_ref().is_some_and(|c| c.globe == g.id && c.worker.as_deref() == worker);
         for g in &self.globes {
             let p = self.place(g, area);
             let a = p.a * g.form.clamp(0.0, 1.0).sqrt();
@@ -954,7 +1105,11 @@ impl Net {
             if let Some(t) = g.ping {
                 ring(&mut segs, p.c, p.r + 12.0 * sc, theme::BONE, 0.9 * ping_light(t, reduced), 1.6 * lws);
             }
-            session_braid(&mut segs, area, g, &p, reduced, self.clock);
+            if let Some(mid) = session_braid(&mut segs, area, g, &p, reduced, self.clock) {
+                if card_on(g, None) {
+                    held_gap = Some(mid);
+                }
+            }
 
             for (i, r) in g.tasks.iter().enumerate() {
                 if r.form <= 0.0 {
@@ -973,7 +1128,7 @@ impl Net {
                     alpha: if r.kind == TaskKind::Monitor { 0.74 } else { 0.55 },
                     col: reach::color(r.kind),
                 };
-                braid(&mut segs, from, to, 0.0, span, span < 1.0, p.a, &spec, &[], area.u, r.age, g.seed + 101 * i as u32, reduced);
+                braid(&mut segs, from, to, 0.0, span, span < 1.0, p.a, &spec, &[], 0.0, area.u, r.age, g.seed + 101 * i as u32, reduced);
                 let secs = r.age + phase(g.seed + i as u32);
                 reach::end(&mut segs, &reach::End { kind: r.kind, from, to, form: r.form, secs, hover: r.hover, alpha: p.a, u: area.u, reduced });
                 if r.hover > 0.01 && r.form > 0.8 {
@@ -996,7 +1151,9 @@ impl Net {
                     worker_label = Some(Label { text, at: [wp.c[0], wp.c[1] - wp.r], alpha: show });
                 }
                 let wa = wp.a * w.form.sqrt();
-                let [br, bg, bb] = theme::BONE.srgb_f32();
+                let held = if g.asker.as_deref() == Some(&w.id) { g.hold } else { 0.0 };
+                let tone = mix(theme::BONE, theme::VERM, held);
+                let [br, bg, bb] = tone.srgb_f32();
                 globes.push(GlobeInst {
                     pos: [wp.c[0], wp.c[1], wp.r, self.rot * 1.3 + phase(g.seed + i as u32)],
                     color: [br, bg, bb, wp.a],
@@ -1005,10 +1162,18 @@ impl Net {
                 if wa > 0.01 {
                     // The worker braid trails out of the parent's nucleus behind the worker and
                     // fades as it turns to dust.
-                    let spec = Braid { strands: 3, fibres: 3, lam: 104.0, amp: 6.0 * g.scale, om: 3.0, width: 1.1, alpha: 0.8, col: theme::BONE };
+                    let spec = Braid { strands: 3, fibres: 3, lam: 104.0, amp: 6.0 * g.scale, om: 3.0, width: 1.1, alpha: 0.8, col: tone };
                     let lit = w.pulses.lit(WORKER_PULSE_SECS, reduced);
-                    braid(&mut segs, p.c, wp.c, 0.08, 1.0, false, wa, &spec, &lit, area.u, g.twist, g.seed + i as u32, reduced);
-                    segs.push(vitals::glow(wp.c[0], wp.c[1], 6.0 * wp.r, theme::BONE, 0.28 * wa));
+                    braid(&mut segs, p.c, wp.c, 0.08, 1.0, false, wa, &spec, &lit, held, area.u, w.twist, g.seed + i as u32, reduced);
+                    segs.push(vitals::glow(wp.c[0], wp.c[1], 6.0 * wp.r, tone, 0.28 * wa));
+                    let mid = bez(p.c, wp.c, 0.08, 0.5);
+                    if held > 0.0 {
+                        let edges = [bez(p.c, wp.c, 0.08, 0.5 - GAP_HALF), bez(p.c, wp.c, 0.08, 0.5 + GAP_HALF)];
+                        hold_marks(&mut segs, mid, edges, wp.c, wp.r, held, self.clock, area.u, reduced);
+                    }
+                    if card_on(g, Some(&w.id)) {
+                        held_gap = Some(mid);
+                    }
                     ticks(&mut segs, wp.c, wp.r + 3.0 * sc * g.scale * grow, 24, 1.5 * sc * g.scale * grow, 0, theme::BONE, 0.3 * wa, lws);
                 }
             }
@@ -1034,7 +1199,31 @@ impl Net {
         for s in &segs {
             std::hash::Hash::hash(&bytemuck::bytes_of(s), &mut h);
         }
-        Some(Frame { globes, segs, key: std::hash::Hasher::finish(&h), label })
+        let card = self.card.as_ref().and_then(|c| {
+            let gap = held_gap.or_else(|| {
+                let g = self.globes.iter().find(|g| g.id == c.globe)?;
+                Some(self.place(g, area).c)
+            })?;
+            if c.at.get().is_none() {
+                c.at.set(Some(gap));
+            }
+            let view = approval::View {
+                card: &c.card,
+                gap,
+                at: c.at.get().unwrap_or(gap),
+                open: c.open,
+                verdict: c.verdict,
+                now_ms: self.now_ms.max(c.card.since_ms),
+                clock: self.clock,
+                x: area.x,
+                band: area.band,
+                k: area.k,
+                u: area.u,
+                reduced,
+            };
+            Some(approval::frame(&view))
+        });
+        Some(Frame { globes, segs, key: std::hash::Hasher::finish(&h), label, card })
     }
 }
 
@@ -1141,7 +1330,8 @@ struct Braid {
 /// the nucleus sends it out as a feeler: it creeps from the centre, its tip closed and
 /// seeking, latches on the globe, and hauls it in. It holds while the session stays near,
 /// and on letting go flickers and unravels back into the knot.
-fn session_braid(out: &mut Vec<Seg>, area: &Area, g: &Globe, p: &Placed, reduced: bool, clock: f32) {
+/// Draws it, and returns its middle, where an ask holds it.
+fn session_braid(out: &mut Vec<Seg>, area: &Area, g: &Globe, p: &Placed, reduced: bool, clock: f32) -> Option<[f32; 2]> {
     let q = |secs: f32| if reduced { REDUCED } else { secs };
     let (reach, alpha) = match g.phase {
         Phase::Pulling => (e_out(g.t / q(GROW)), 1.0),
@@ -1151,16 +1341,17 @@ fn session_braid(out: &mut Vec<Seg>, area: &Area, g: &Globe, p: &Placed, reduced
         Phase::Releasing if g.t < q(FLICKER) => (1.0, if reduced { 1.0 } else { 0.55 + 0.45 * (g.t * 60.0).sin().abs() }),
         Phase::Releasing => (1.0 - ((g.t - q(FLICKER)) / q(UNRAVEL)).clamp(0.0, 1.0), 1.0),
         Phase::Dissolving if g.ended_near => (g.form, 1.0),
-        _ => return,
+        _ => return None,
     };
     if reach <= 0.0 {
-        return;
+        return None;
     }
     let (a0, a1) = (area.knot, p.c);
     // Waiting on a program, the braid greys a little and breathes slowly.
     let breath = 0.5 - 0.5 * (TAU * g.breath / BREATH).cos();
     let alpha = alpha * (1.0 - BREATH_DIM * g.wait * breath);
-    let col = grey(if g.codex { theme::FROST } else { theme::EMBER }, WAIT_GREY * g.wait);
+    let held = if g.asker.is_none() { g.hold } else { 0.0 };
+    let col = mix(grey(if g.codex { theme::FROST } else { theme::EMBER }, WAIT_GREY * g.wait), theme::VERM, held);
     // A headless run keeps one loose fibre, so its pulses have a thread to ride.
     let (strands, fibres) = if g.headless { (3, 1) } else { (6, 4) };
     let spec = Braid { strands, fibres, lam: 118.0, amp: 9.0, om: 3.4, width: 1.25, alpha: 0.9, col };
@@ -1176,11 +1367,43 @@ fn session_braid(out: &mut Vec<Seg>, area: &Area, g: &Globe, p: &Placed, reduced
     // Any end on the move, reaching out or unravelling back, closes to a point.
     let feeling = reach < 1.0;
     let lit = g.pulses.lit(PULSE_SECS, reduced);
-    let tip = braid(out, a0, a1, bow, reach, feeling, alpha, &spec, &lit, area.u, g.twist, g.seed, reduced);
+    let tip = braid(out, a0, a1, bow, reach, feeling, alpha, &spec, &lit, held, area.u, g.twist, g.seed, reduced);
     if feeling && matches!(g.phase, Phase::Pulling | Phase::Docked) {
         // A hot spark rides the feeler's tip as it reaches out.
         out.push(vitals::glow(tip[0], tip[1], 26.0 * area.u, theme::HOT, 0.9));
     }
+    let gap = bez(a0, a1, bow, 0.5);
+    if held > 0.0 {
+        let edges = [bez(a0, a1, bow, 0.5 - GAP_HALF), bez(a0, a1, bow, 0.5 + GAP_HALF)];
+        hold_marks(out, gap, edges, p.c, p.r, held, clock, area.u, reduced);
+    }
+    Some(gap)
+}
+
+/// `a` moved `t` of the way to `b`.
+fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
+    let t = t.clamp(0.0, 1.0);
+    let ch = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t).round() as u8;
+    Rgb(ch(a.0, b.0), ch(a.1, b.1), ch(a.2, b.2))
+}
+
+/// What marks a held braid, after the prototype's suspended gap and approval veil: a soft
+/// vermilion veil over the gap, a breathing cap and cross-tick at each frayed edge, and a
+/// breathing ring round the globe that asked.
+#[allow(clippy::too_many_arguments)]
+fn hold_marks(out: &mut Vec<Seg>, gap: [f32; 2], edges: [[f32; 2]; 2], c: [f32; 2], r: f32, held: f32, clock: f32, u: f32, reduced: bool) {
+    let (sc, lws) = (2.0 * u, (1.6 * u).max(1.0));
+    let br = if reduced { 1.0 } else { 0.65 + 0.35 * (clock * 4.5).sin() };
+    out.push(vitals::glow(gap[0], gap[1], 160.0 * sc.max(0.8), theme::VERM, 0.5 * held * (0.8 + 0.2 * br)));
+    let (dx, dy) = (edges[1][0] - edges[0][0], edges[1][1] - edges[0][1]);
+    let d = (dx * dx + dy * dy).sqrt().max(1e-3);
+    let (nx, ny) = (-dy / d, dx / d);
+    for e in edges {
+        out.push(vitals::glow(e[0], e[1], 44.0 * sc, theme::VERM, br * held));
+        let t = 10.0 * sc;
+        out.push(vitals::seg([e[0] + nx * t, e[1] + ny * t], [e[0] - nx * t, e[1] - ny * t], theme::VERM, 0.95 * held, 2.0 * lws));
+    }
+    ring(out, c, r + (10.0 + 4.0 * br) * sc, theme::VERM, 0.8 * held * br, 1.8 * lws);
 }
 
 /// `c` with share `k` of its colour drained toward a grey of the same luma.
@@ -1216,8 +1439,11 @@ fn bez(a0: [f32; 2], a1: [f32; 2], bow: f32, t: f32) -> [f32; 2] {
 ///
 /// The loose fibres flow toward `a0`, the core or parent end, and the `lit` pulses ride
 /// them there. The strands and the underglow never carry a pulse.
+///
+/// A `gap` above 0 holds the braid open at its middle: strands fray outward at its edges
+/// and nothing is drawn across it.
 #[allow(clippy::too_many_arguments)]
-fn braid(out: &mut Vec<Seg>, a0: [f32; 2], a1: [f32; 2], bow: f32, reach: f32, feeling: bool, alpha: f32, b: &Braid, lit: &[Lit], u: f32, twist: f32, seed: u32, reduced: bool) -> [f32; 2] {
+fn braid(out: &mut Vec<Seg>, a0: [f32; 2], a1: [f32; 2], bow: f32, reach: f32, feeling: bool, alpha: f32, b: &Braid, lit: &[Lit], gap: f32, u: f32, twist: f32, seed: u32, reduced: bool) -> [f32; 2] {
     let sc = 2.0 * u;
     let lws = (1.6 * u).max(1.0);
     // Points along the bow, one every 14 prototype pixels, with arc length and unit normal.
@@ -1245,16 +1471,22 @@ fn braid(out: &mut Vec<Seg>, a0: [f32; 2], a1: [f32; 2], bow: f32, reach: f32, f
         x * x * (3.0 - 2.0 * x)
     };
     let tail = PULSE_TAIL * sc;
+    // Segments inside the held gap are not drawn.
+    let held = |i: usize| gap > 0.01 && ((gl[i] + gl[i + 1]) * 0.5 / total - 0.5).abs() < GAP_HALF * gap;
     // `flow` is the wave's direction: +1 runs toward `a1`, -1 toward `a0`.
     let strand = |out: &mut Vec<Seg>, amp: f32, lam: f32, off: f32, a: f32, w: f32, flow: f32, lit: &[Lit]| {
         let at = |i: usize| {
             let s = gl[i] / total;
-            let tap = (PI * s).sin().max(0.0).powf(0.7) * closing(gl[i]);
+            let fray = 2.6 * gap * ((-((s - 0.5 + GAP_HALF) / 0.035).powi(2)).exp() + (-((s - 0.5 - GAP_HALF) / 0.035).powi(2)).exp());
+            let tap = ((PI * s).sin().max(0.0).powf(0.7) + fray) * closing(gl[i]);
             let wv = TAU * gl[i] / lam - flow * ph + off + phase(seed);
             let nn = normal(i);
             ([pts[i][0] + nn[0] * amp * tap * wv.sin(), pts[i][1] + nn[1] * amp * tap * wv.sin()], wv.cos())
         };
         for i in 0..last {
+            if held(i) {
+                continue;
+            }
             let ((p0, d0), (p1, d1)) = (at(i), at(i + 1));
             let depth = ((d0 + d1) * 0.25 + 0.5).clamp(0.0, 1.0);
             out.push(vitals::seg(p0, p1, b.col, a * (0.5 + 0.5 * depth), w));
@@ -1285,6 +1517,9 @@ fn braid(out: &mut Vec<Seg>, a0: [f32; 2], a1: [f32; 2], bow: f32, reach: f32, f
     // Underglow: one wide, faint band along the path. Soft strokes peak at a third of a
     // hard stroke's mean coverage, so the band carries three times the prototype's alpha.
     for i in 0..last {
+        if held(i) {
+            continue;
+        }
         let k = closing(gl[i + 1].min(end));
         out.push(vitals::soft(pts[i], pts[i + 1], b.col, 0.15 * alpha * k, (2.0 * amp + 6.0 * sc) * (0.3 + 0.7 * k)));
     }
@@ -1313,6 +1548,7 @@ pub fn canned() -> Vec<SessionInfo> {
             .collect(),
         pending: None,
         tasks: Vec::new(),
+        decided: None,
     };
     let mut erebus = s("aabbb6cd", "erebus", true, 2);
     erebus.tasks = vec![
@@ -1528,7 +1764,7 @@ mod tests {
         let spec = Braid { strands: 6, fibres: 4, lam: 118.0, amp: 9.0, om: 3.4, width: 1.25, alpha: 0.9, col: theme::EMBER };
         let (a0, a1) = ([0.0, 0.0], [1000.0, 0.0]);
         let mut out = Vec::new();
-        let tip = braid(&mut out, a0, a1, 0.0, 0.5, true, 1.0, &spec, &[], 1.0, 0.3, 7, false);
+        let tip = braid(&mut out, a0, a1, 0.0, 0.5, true, 1.0, &spec, &[], 0.0, 1.0, 0.3, 7, false);
         // The underglow narrows and fades into the tip, and no strand strays from the path
         // near it.
         let glow: Vec<&Seg> = out.iter().filter(|s| s.width[1] > 2.5).collect();
@@ -1673,8 +1909,8 @@ mod tests {
         let spec = Braid { strands: 6, fibres: 4, lam: 118.0, amp: 9.0, om: 3.4, width: 1.25, alpha: 0.9, col: theme::EMBER };
         let lit = [Lit { head: 0.5, light: 1.0, col: theme::VERM, whole: false }];
         let (mut plain, mut pulsed) = (Vec::new(), Vec::new());
-        braid(&mut plain, [0.0, 0.0], [800.0, 0.0], 0.1, 1.0, false, 1.0, &spec, &[], 1.0, 0.4, 3, false);
-        braid(&mut pulsed, [0.0, 0.0], [800.0, 0.0], 0.1, 1.0, false, 1.0, &spec, &lit, 1.0, 0.4, 3, false);
+        braid(&mut plain, [0.0, 0.0], [800.0, 0.0], 0.1, 1.0, false, 1.0, &spec, &[], 0.0, 1.0, 0.4, 3, false);
+        braid(&mut pulsed, [0.0, 0.0], [800.0, 0.0], 0.1, 1.0, false, 1.0, &spec, &lit, 0.0, 1.0, 0.4, 3, false);
         let red: Vec<&Seg> = pulsed.iter().filter(|s| s.color[3] > 0.0 && (s.color[0] / s.color[3] - theme::VERM.srgb_f32()[0]).abs() < 0.01 && (s.color[1] / s.color[3] - theme::VERM.srgb_f32()[1]).abs() < 0.01).collect();
         assert!(!red.is_empty());
         // Every ember segment of the plain braid is still there, untouched: the pulse only adds.
@@ -1696,7 +1932,7 @@ mod tests {
         let spec = Braid { strands: 1, fibres: 1, lam: 118.0, amp: 9.0, om: 3.4, width: 1.25, alpha: 0.9, col: theme::EMBER };
         let wave = |twist: f32, fibre: bool| {
             let mut out = Vec::new();
-            braid(&mut out, [0.0, 0.0], [2000.0, 0.0], 0.0, 1.0, false, 1.0, &spec, &[], 1.0, twist, 0, false);
+            braid(&mut out, [0.0, 0.0], [2000.0, 0.0], 0.0, 1.0, false, 1.0, &spec, &[], 0.0, 1.0, twist, 0, false);
             let segs: Vec<&Seg> = out.iter().filter(|s| s.width[1] == 0.0).collect();
             let half = segs.len() / 2;
             let part = if fibre { &segs[half..] } else { &segs[..half] };
@@ -1952,6 +2188,131 @@ mod tests {
         // A braid only pushes once touched.
         let clear = Body { circles: vec![], segments: vec![([-5.0, r + BRAID_HALF + 0.01], [5.0, r + BRAID_HALF + 0.01], BRAID_HALF, BRAID_GIVE)] };
         assert!(contacts(&globe, &clear).is_empty());
+    }
+
+    fn asking(id: &str, worker: Option<&str>, since: u64) -> SessionInfo {
+        let mut s = info(id, true, 1);
+        s.pending = Some(Pending {
+            tool_use_id: format!("{id}-ask"),
+            tool: "Bash".into(),
+            worker: worker.map(str::to_owned),
+            since_unix_ms: since,
+            summary: Some("cargo test".into()),
+        });
+        s
+    }
+
+    fn answered(id: &str, granted: bool, at: u64) -> SessionInfo {
+        let mut s = info(id, true, 1);
+        s.decided = Some(erebus_protocol::Decided { tool_use_id: format!("{id}-ask"), granted, unix_ms: at });
+        s
+    }
+
+    fn docked(sessions: &[SessionInfo]) -> (Net, u64) {
+        let mut now = T0;
+        let mut n = net();
+        n.ingest_sessions(sessions, now);
+        n.finish();
+        run(&mut n, 0.1, &mut now);
+        (n, now)
+    }
+
+    #[test]
+    fn an_ask_holds_the_braid_and_its_twist_stops_smoothly() {
+        let (mut n, mut now) = docked(&[info("a", true, 1)]);
+        n.ingest_sessions(&[asking("a", None, now)], now);
+        let (mut hold, mut twist) = (0.0, n.globes[0].twist);
+        let mut rate = f32::MAX;
+        for i in 0..(HOLD_SECS * 60.0) as u32 + 10 {
+            run(&mut n, 1.0 / 60.0, &mut now);
+            let g = &n.globes[0];
+            assert!(g.hold >= hold && g.hold - hold < 0.05, "the hold steps at {i}");
+            let r = g.twist - twist;
+            assert!(r <= rate + 1e-6, "the twist speeds up while holding at {i}");
+            (hold, twist, rate) = (g.hold, g.twist, r);
+        }
+        assert_eq!(hold, 1.0);
+        assert!(rate < 1e-6, "held still");
+        // Answered, it lets go and twists again.
+        n.ingest_sessions(&[answered("a", true, now)], now);
+        run(&mut n, HOLD_SECS + 0.1, &mut now);
+        assert_eq!(n.globes[0].hold, 0.0);
+        let t = n.globes[0].twist;
+        run(&mut n, 0.5, &mut now);
+        assert!(n.globes[0].twist > t);
+    }
+
+    #[test]
+    fn the_gap_is_open_only_while_held() {
+        let spec = Braid { strands: 6, fibres: 4, lam: 118.0, amp: 9.0, om: 3.4, width: 1.25, alpha: 0.9, col: theme::EMBER };
+        let mid = |gap: f32| {
+            let mut out = Vec::new();
+            braid(&mut out, [0.0, 0.0], [1000.0, 0.0], 0.0, 1.0, false, 1.0, &spec, &[], gap, 1.0, 0.3, 1, false);
+            out.iter().filter(|s| s.width[1] < 1.5 && ((s.ab[0] + s.ab[2]) / 2.0 - 500.0).abs() < 30.0).count()
+        };
+        assert!(mid(0.0) > 0, "a free braid crosses its middle");
+        assert_eq!(mid(1.0), 0, "a held one does not");
+    }
+
+    #[test]
+    fn the_oldest_ask_gets_the_card_and_the_rest_dims() {
+        let (mut n, mut now) = docked(&[info("a", true, 1), info("b", true, 0), info("c", true, 0)]);
+        n.ingest_sessions(&[asking("a", None, now + 500), asking("b", None, now), info("c", true, 0)], now);
+        run(&mut n, 1.0, &mut now);
+        let card = n.card.as_ref().expect("a card");
+        assert_eq!(card.globe, "b", "the oldest ask");
+        assert!(card.open > 0.99);
+        let a = |id: &str| n.place(get(&n, id).unwrap(), &area()).a;
+        assert!(a("c") < 0.3 * a("b"), "others dim: {} vs {}", a("c"), a("b"));
+        let f = n.frame(&area(), false).unwrap();
+        let card = f.card.expect("the card is drawn");
+        assert!(card.text.items.iter().any(|i| i.text == "cargo test"));
+    }
+
+    #[test]
+    fn a_verdict_shows_then_the_card_folds_and_the_focus_lifts() {
+        let (mut n, mut now) = docked(&[info("a", true, 1)]);
+        n.ingest_sessions(&[asking("a", Some("a-w0"), now)], now);
+        run(&mut n, 1.0, &mut now);
+        assert!(n.globes[0].workers[0].twist > 0.0);
+        n.ingest_sessions(&[answered("a", false, now)], now);
+        assert_eq!(n.card.as_ref().unwrap().verdict, Some(false));
+        assert!(n.globes[0].workers[0].pulses.busy(), "the verdict runs home along the worker's braid");
+        run(&mut n, VERDICT_SECS * 0.5, &mut now);
+        assert!(n.card.is_some(), "the verdict shows a while");
+        run(&mut n, VERDICT_SECS * 0.5 + CARD_OPEN + 0.2, &mut now);
+        assert!(n.card.is_none());
+        run(&mut n, 2.0, &mut now);
+        assert_eq!(n.focus, 0.0);
+    }
+
+    #[test]
+    fn the_card_stays_on_the_braid_after_the_answer() {
+        let (mut n, mut now) = docked(&[info("a", true, 1)]);
+        n.ingest_sessions(&[asking("a", None, now)], now);
+        run(&mut n, 1.0, &mut now);
+        let at = |n: &Net| n.frame(&area(), false).unwrap().card.map(|c| c.rects[0].0);
+        let before = at(&n).unwrap();
+        n.ingest_sessions(&[answered("a", true, now)], now);
+        // It stays exactly where it unfolded, through the sway, the answer and the fold.
+        for i in 0..((HOLD_SECS + VERDICT_SECS) * 60.0) as u32 {
+            run(&mut n, 1.0 / 60.0, &mut now);
+            let Some(r) = at(&n) else { break };
+            assert_eq!(r[..2], before[..2], "the card moves at {i}");
+        }
+    }
+
+    #[test]
+    fn an_ask_that_vanishes_unanswered_folds_the_card() {
+        let (mut n, mut now) = docked(&[info("a", true, 1)]);
+        n.ingest_sessions(&[asking("a", None, now)], now);
+        run(&mut n, 1.0, &mut now);
+        n.ingest_sessions(&[info("a", true, 1)], now);
+        run(&mut n, 0.1, &mut now);
+        let c = n.card.as_ref().unwrap();
+        assert!(c.closing && c.verdict.is_none());
+        run(&mut n, CARD_OPEN + 0.1, &mut now);
+        assert!(n.card.is_none());
     }
 
     #[test]

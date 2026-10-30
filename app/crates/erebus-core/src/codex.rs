@@ -636,6 +636,7 @@ impl Service {
                         .collect(),
                     pending: None,
                     tasks: Vec::new(),
+                    decided: None,
                 }
             })
             .collect();

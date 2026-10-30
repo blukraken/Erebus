@@ -1058,7 +1058,8 @@ impl App {
             file_label_alpha: globe_label.map_or(self.sim.file_hover(), |l| l.alpha),
             more: more.as_deref(),
             vitals: vitals.as_ref(),
-            panel: panel.as_ref(),
+            // The approval card takes the panel's place while it shows.
+            panel: net.as_ref().and_then(|n| n.card.as_ref()).or(panel.as_ref()),
             feed: feed.as_ref(),
             net: net.as_ref(),
         };

@@ -317,7 +317,7 @@ pub fn run(shot: &Shot) -> Result<(), String> {
             file_label_alpha: sim.file_hover(),
             more: more.as_deref(),
             vitals: vf.as_ref(),
-            panel: pf.as_ref(),
+            panel: nf.as_ref().and_then(|n| n.card.as_ref()).or(pf.as_ref()),
             feed: ff.as_ref(),
             net: nf.as_ref(),
         };
@@ -410,7 +410,7 @@ pub fn run(shot: &Shot) -> Result<(), String> {
             file_label_alpha: sim.file_hover(),
             more: more.as_deref(),
             vitals: vf.as_ref(),
-            panel: pf.as_ref(),
+            panel: nf.as_ref().and_then(|n| n.card.as_ref()).or(pf.as_ref()),
             feed: ff.as_ref(),
             net: nf.as_ref(),
         };

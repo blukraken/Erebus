@@ -43,7 +43,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use erebus_protocol::{
-    FeedEvent, FeedKind, Pending, SessionInfo, SessionStatus, TaskInfo, TaskKind, WorkerInfo, FEED_HISTORY, MAX_PHRASE,
+    Decided, FeedEvent, FeedKind, Pending, SessionInfo, SessionStatus, TaskInfo, TaskKind, WorkerInfo, FEED_HISTORY, MAX_PHRASE,
 };
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::de::{Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
@@ -85,6 +85,8 @@ pub(crate) const LONG_TOOL_MS: u64 = 10_000;
 const STALE_WORKER_MS: u64 = 30 * 60 * 1000;
 
 /// Resolved tool calls are remembered this long, so a late ask for one is ignored.
+/// A shown ask's verdict stays on its session this long, milliseconds.
+const DECIDED_KEEP_MS: u64 = 5_000;
 const RESOLVED_KEEP_MS: u64 = 60_000;
 
 /// An ask for a session the core does not know is dropped after this long.
@@ -320,7 +322,7 @@ impl Service {
         self.asks.prune(now, &live);
 
         let mut infos: Vec<SessionInfo> =
-            self.sessions.iter().map(|s| s.info(self.asks.pending(&s.id, now))).collect();
+            self.sessions.iter().map(|s| s.info(self.asks.pending(&s.id, now), self.asks.decided(&s.id, now))).collect();
         infos.sort_by(|a, b| (a.started_unix_ms, &a.label).cmp(&(b.started_unix_ms, &b.label)));
         let counts = (infos.len(), infos.iter().map(|s| s.workers.len()).sum());
         if counts != self.counts {
@@ -447,10 +449,11 @@ impl Service {
                 continue;
             }
             match r.kind.as_str() {
-                "ask" => {
+                "ask" if r.dialog => {
                     let ask = Ask {
                         session: r.session,
                         tool: r.tool.unwrap_or_else(|| "tool".into()),
+                        summary: r.summary.map(|s| clip(&s, 200)),
                         agent: r.agent,
                         unix_ms: r.unix_ms,
                         seen: now,
@@ -459,7 +462,8 @@ impl Service {
                     self.asks.ask(r.tool_use_id, ask);
                 }
                 "done" => {
-                    let Some(a) = self.asks.resolve(&r.tool_use_id, now) else { continue };
+                    let granted = r.outcome.as_deref() != Some("denied");
+                    let Some(a) = self.asks.resolve(&r.tool_use_id, now, Some(granted)) else { continue };
                     if !a.shown {
                         continue;
                     }
@@ -691,7 +695,7 @@ impl Session {
         self.born_live && created_ms + BIRTH_SLACK_MS >= self.started_ms
     }
 
-    fn info(&self, pending: Option<Pending>) -> SessionInfo {
+    fn info(&self, pending: Option<Pending>, decided: Option<Decided>) -> SessionInfo {
         let mut workers: Vec<(&String, &Agent)> = self.agents.iter().filter(|(_, a)| a.live).collect();
         workers.sort_by_key(|(_, a)| a.n);
         SessionInfo {
@@ -712,6 +716,7 @@ impl Session {
                 })
                 .collect(),
             pending,
+            decided,
             tasks: {
                 let mut t: Vec<TaskInfo> = self
                     .tasks
@@ -942,7 +947,9 @@ impl Session {
                 }
             }
             Fact::Return { id, error, declined, decision, launched, bg_task, monitor_task } => {
-                asks.resolve(&id, ms);
+                // A person's reject or a declined call was a denial; anything else ran.
+                let rejected = decision.as_ref().is_some_and(|d| d.decision == "reject");
+                asks.resolve(&id, ms, Some(!(declined || rejected)));
                 let call = self.calls.remove(&id);
                 let tool = call.as_ref().map_or("tool", |c| c.tool.as_str()).to_owned();
                 let label = call.as_ref().map_or_else(|| tool.clone(), |c| c.label.clone());
@@ -1065,6 +1072,7 @@ fn read_meta(p: &Path) -> Option<MetaFile> {
 struct Ask {
     session: String,
     tool: String,
+    summary: Option<String>,
     agent: Option<String>,
     unix_ms: u64,
     /// When the core read it.
@@ -1078,6 +1086,8 @@ struct Asks {
     open: HashMap<String, Ask>,
     /// Tool calls already resolved, with when.
     resolved: HashMap<String, u64>,
+    /// The last shown ask's verdict per session, kept for `DECIDED_KEEP_MS`.
+    decided: HashMap<String, Decided>,
 }
 
 impl Asks {
@@ -1087,9 +1097,19 @@ impl Asks {
         }
     }
 
-    fn resolve(&mut self, tool_use_id: &str, ms: u64) -> Option<Ask> {
+    /// Closes an ask. One that was shown leaves its verdict, when known, on its session.
+    fn resolve(&mut self, tool_use_id: &str, ms: u64, granted: Option<bool>) -> Option<Ask> {
         self.resolved.insert(tool_use_id.to_owned(), ms);
-        self.open.remove(tool_use_id)
+        let a = self.open.remove(tool_use_id)?;
+        if let (true, Some(granted)) = (a.shown, granted) {
+            self.decided.insert(a.session.clone(), Decided { tool_use_id: tool_use_id.to_owned(), granted, unix_ms: ms });
+        }
+        Some(a)
+    }
+
+    /// The session's last verdict while it is fresh.
+    fn decided(&self, session: &str, now: u64) -> Option<Decided> {
+        self.decided.get(session).filter(|d| now.saturating_sub(d.unix_ms) < DECIDED_KEEP_MS).cloned()
     }
 
     /// The oldest settled ask for `session`. Marks every settled ask as shown.
@@ -1106,7 +1126,7 @@ impl Asks {
         }
         let id = best?.1.clone();
         let a = &self.open[&id];
-        Some(Pending { tool_use_id: id, tool: a.tool.clone(), worker: a.agent.clone(), since_unix_ms: a.unix_ms })
+        Some(Pending { tool_use_id: id, tool: a.tool.clone(), worker: a.agent.clone(), since_unix_ms: a.unix_ms, summary: a.summary.clone() })
     }
 
     /// When the next unsettled ask settles, if one does in the future.
@@ -1116,6 +1136,7 @@ impl Asks {
 
     fn prune(&mut self, now: u64, live: &HashSet<String>) {
         self.resolved.retain(|_, t| now.saturating_sub(*t) < RESOLVED_KEEP_MS);
+        self.decided.retain(|_, d| now.saturating_sub(d.unix_ms) < DECIDED_KEEP_MS);
         self.open.retain(|_, a| live.contains(&a.session) || now.saturating_sub(a.seen) < ORPHAN_ASK_MS);
     }
 }
@@ -1133,6 +1154,12 @@ struct SpoolRec {
     agent: Option<String>,
     #[serde(default)]
     outcome: Option<String>,
+    #[serde(default)]
+    summary: Option<String>,
+    /// Set when a permission dialog was put to a person. Earlier mod versions wrote an ask for
+    /// every check that asked, which the auto-mode classifier mostly settles alone.
+    #[serde(default)]
+    dialog: bool,
 }
 
 /// Reads a file from a byte offset, one batch of complete lines at a time.
@@ -2354,13 +2381,13 @@ mod tests {
         lines.push(call("m1", "Monitor", r#"{"command":"tail -f build.log","description":"build log","timeout_ms":60000}"#, 2000));
         lines.push(result("m1", false, r#","toolUseResult":{"taskId":"m9","timeoutMs":60000,"persistent":false}"#, 2001));
         feed(&mut s, &lines);
-        let tasks = s.info(None).tasks;
+        let tasks = s.info(None, None).tasks;
         assert_eq!(tasks.len(), 2);
         assert_eq!((tasks[0].kind, tasks[0].label.as_str(), tasks[0].id.as_str()), (TaskKind::Shell, "sleep", "b1"));
         assert_eq!((tasks[1].kind, tasks[1].label.as_str()), (TaskKind::Monitor, "build log"));
         assert_eq!(tasks[0].started_unix_ms, parse_ts(&ts(1000)).unwrap());
         feed(&mut s, &[note("t1", "b1", "completed", 3000)]);
-        let tasks = s.info(None).tasks;
+        let tasks = s.info(None, None).tasks;
         assert_eq!(tasks.iter().map(|t| t.kind).collect::<Vec<_>>(), [TaskKind::Monitor]);
     }
 
@@ -2747,14 +2774,22 @@ mod tests {
     #[test]
     fn asks_settle_then_resolve() {
         let mut asks = Asks::default();
-        let ask = |session: &str, at: u64| Ask { session: session.into(), tool: "Bash".into(), agent: None, unix_ms: at, seen: at, shown: false };
+        let ask = |session: &str, at: u64| Ask { session: session.into(), tool: "Bash".into(), summary: Some("ls".into()), agent: None, unix_ms: at, seen: at, shown: false };
         asks.ask("t1".into(), ask("s1", 1000));
         assert_eq!(asks.pending("s1", 2000), None);
         assert_eq!(asks.next_settle(2000), Some(2500));
         let p = asks.pending("s1", 2500).expect("settled");
         assert_eq!((p.tool_use_id.as_str(), p.since_unix_ms), ("t1", 1000));
         assert_eq!(asks.pending("s2", 2500), None);
-        assert!(asks.resolve("t1", 3000).unwrap().shown);
+        assert_eq!(p.summary.as_deref(), Some("ls"));
+        assert!(asks.resolve("t1", 3000, Some(false)).unwrap().shown);
+        // Its verdict stays on the session for a few seconds.
+        assert_eq!(asks.decided("s1", 3000 + DECIDED_KEEP_MS - 1).map(|d| d.granted), Some(false));
+        assert_eq!(asks.decided("s1", 3000 + DECIDED_KEEP_MS), None);
+        // An ask never shown leaves no verdict.
+        asks.ask("t3".into(), ask("s3", 5000));
+        asks.resolve("t3", 5100, Some(true));
+        assert_eq!(asks.decided("s3", 5200), None);
         // A late ask for a resolved call is ignored.
         asks.ask("t1".into(), ask("s1", 1000));
         assert_eq!(asks.pending("s1", 4000), None);

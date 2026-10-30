@@ -228,13 +228,13 @@ fn hash(i: u32, salt: u32) -> f32 {
 }
 
 /// The part of `[x, y, w, h]` left of `front`.
-fn clip_rect([x, y, w, h]: [f32; 4], front: f32) -> Option<[f32; 4]> {
+pub(crate) fn clip_rect([x, y, w, h]: [f32; 4], front: f32) -> Option<[f32; 4]> {
     let w = w.min(front - x);
     (w > 0.0).then_some([x, y, w, h])
 }
 
 /// A stroke cut at `front`, or nothing when it starts past it.
-fn clip_seg(a: [f32; 2], b: [f32; 2], front: f32) -> Option<([f32; 2], [f32; 2])> {
+pub(crate) fn clip_seg(a: [f32; 2], b: [f32; 2], front: f32) -> Option<([f32; 2], [f32; 2])> {
     if a[0] > front {
         return None;
     }

@@ -41,6 +41,7 @@
 //! `--commit-at` fires the commit that many seconds into the sequence.
 
 mod app;
+mod approval;
 mod codex;
 mod feed;
 mod files;
