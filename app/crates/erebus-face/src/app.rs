@@ -4,7 +4,7 @@
 //! | State | When | Frames |
 //! |---|---|---|
 //! | Suspended | hidden to tray, minimised, or covered by the foreground window | none |
-//! | Glance | visible, no input for [`GLANCE_AFTER`] | 30 fps cap, half the dots |
+//! | Glance | visible, no input for [`GLANCE_AFTER`] | as Calm, so the scene looks the same unfocused |
 //! | Calm | visible, recent input | 60 fps cap, full detail |
 //!
 //! Fullscreen also presents on every cursor move; see [`MOTION_FRAMES`]. With Windows
@@ -79,7 +79,7 @@ const STEADY: [&str; 3] = ["idle present", "cursor motion", "animate"];
 /// Calm turns to Glance after this long without input.
 const GLANCE_AFTER: Duration = Duration::from_secs(10);
 const CALM_FRAME: Duration = Duration::from_nanos(1_000_000_000 / 60);
-const GLANCE_FRAME: Duration = Duration::from_nanos(1_000_000_000 / 30);
+const GLANCE_FRAME: Duration = CALM_FRAME;
 /// How often the cover and animation-setting checks run while the window is visible.
 const POLL: Duration = Duration::from_millis(500);
 
@@ -156,6 +156,9 @@ struct Activity {
     /// Main-thread CPU at `since`, and wall time spent in `render`, microseconds.
     cpu0: u64,
     render_us: u64,
+    /// Longest gap between frames, microseconds, and network segments cut by the cap.
+    gap_us: u64,
+    dropped: usize,
 }
 
 struct App {
@@ -475,7 +478,7 @@ impl App {
         }
         let a = std::mem::take(&mut self.activity);
         log::info!(
-            "+{} ms activity over {} ms: {} moves, {} frames, {} idle frames, {} motion frames, {} anim frames, {} cursor sets, {:?}, main thread CPU {} us, render {} us",
+            "+{} ms activity over {} ms: {} moves, {} frames, {} idle frames, {} motion frames, {} anim frames, {} cursor sets, {:?}, main thread CPU {} us, render {} us, max gap {} us, segs dropped {}",
             self.ms(),
             dt.as_millis(),
             a.moves,
@@ -487,6 +490,8 @@ impl App {
             self.state.state,
             thread_cpu_us().saturating_sub(a.cpu0),
             a.render_us,
+            a.gap_us,
+            a.dropped,
         );
     }
 
@@ -572,7 +577,7 @@ impl App {
             frames as f64 / secs.max(1e-3)
         );
         self.state = StateLog { state: next, since: now, frames: 0 };
-        self.sim.lod_target = if next == RenderState::Glance { 0.0 } else { 1.0 };
+        self.sim.lod_target = 1.0;
         if prev == RenderState::Suspended {
             // Missed events do not replay: the knot resumes at the current state.
             self.sim.snap();
@@ -983,6 +988,7 @@ impl App {
         self.update_state(now);
         let dt = now.duration_since(self.last_sim).as_secs_f32();
         self.last_sim = now;
+        self.count(|a| a.gap_us = a.gap_us.max((dt * 1e6) as u64));
         self.sim.step(dt, self.reduced);
         self.net.step(dt, self.reduced, unix_ms());
         self.vitals.step(dt, self.reduced);
@@ -1037,6 +1043,7 @@ impl App {
             self.net.set_area(a);
         }
         let net = area.as_ref().and_then(|a| self.net.frame(a, self.reduced));
+        let dropped = net.as_ref().map_or(0, |n| n.dropped);
         // Name chips give way to a hovered file's label, fading as it fades in.
         let give = 1.0 - self.sim.file_hover();
         let chips: Vec<net::Label> = net
@@ -1074,6 +1081,7 @@ impl App {
 
         let spent = t0.elapsed().as_micros() as u64;
         self.count(|a| a.render_us += spent);
+        self.count(|a| a.dropped = a.dropped.max(dropped));
         self.frames += 1;
         self.state.frames += 1;
         self.last_frame = now;

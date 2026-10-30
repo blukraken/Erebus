@@ -30,6 +30,8 @@ pub struct GlobeInst {
     pub color: [f32; 4],
     /// Kind (0 session, 1 worker), form 0..1 (0 scattered dust, 1 whole), core jitter amplitude, seed.
     pub form: [f32; 4],
+    /// Grey 0..1, as a waiting session's braid greys; the rest unused.
+    pub look: [f32; 4],
 }
 
 impl GlobeInst {
@@ -345,7 +347,7 @@ mod tests {
 
     #[test]
     fn sizes_match_wgsl() {
-        assert_eq!(size_of::<GlobeInst>(), 3 * 16);
+        assert_eq!(size_of::<GlobeInst>(), 4 * 16);
         assert_eq!(size_of::<Uniform>(), 2 * 16);
     }
 
@@ -371,7 +373,7 @@ mod tests {
     }
 
     fn globe(kind: f32, x: f32, y: f32, r: f32, form: f32, seed: f32) -> GlobeInst {
-        GlobeInst { pos: [x, y, r, 0.7], color: ember(), form: [kind, form, 0.16, seed] }
+        GlobeInst { pos: [x, y, r, 0.7], color: ember(), form: [kind, form, 0.16, seed], look: [0.0; 4] }
     }
 
     struct Target {
@@ -578,8 +580,8 @@ mod tests {
             let mut g = Vec::new();
             for k in 0..each {
                 let (x, y) = (2600.0 + 260.0 * (k / 4) as f32, 200.0 + 340.0 * (k % 4) as f32);
-                g.push(GlobeInst { pos: [x, y, 64.0, rot], color: ember(), form: [0.0, 1.0, 0.16, k as f32] });
-                g.push(GlobeInst { pos: [x + 130.0, y + 170.0, 40.0, rot], color: ember(), form: [1.0, 1.0, 0.0, 100.0 + k as f32] });
+                g.push(GlobeInst { pos: [x, y, 64.0, rot], color: ember(), form: [0.0, 1.0, 0.16, k as f32], look: [0.0; 4] });
+                g.push(GlobeInst { pos: [x + 130.0, y + 170.0, 40.0, rot], color: ember(), form: [1.0, 1.0, 0.0, 100.0 + k as f32], look: [0.0; 4] });
             }
             g
         };

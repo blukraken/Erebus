@@ -200,6 +200,8 @@ struct SegOut {
     @location(1) @interpolate(flat) color: vec4f,
     // Length, half-width, kind: 0 stroke, 1 round dot, 2 soft glow.
     @location(2) @interpolate(flat) dims: vec3f,
+    // Brightness at each end, plus one; zero means even along the whole length.
+    @location(3) @interpolate(flat) ramp: vec2f,
 };
 
 @vertex
@@ -223,7 +225,16 @@ fn seg_vs(@builtin(vertex_index) i: u32, s: SegIn) -> SegOut {
     out.local = vec2f(along, across);
     out.color = s.color;
     out.dims = vec3f(len, hw, s.width.y);
+    out.ramp = s.width.zw;
     return out;
+}
+
+// A stroke's brightness at `x` pixels along it: even, or blended from end to end.
+fn ramp(in: SegOut, x: f32) -> f32 {
+    if in.ramp.x < 0.5 {
+        return 1.0;
+    }
+    return mix(in.ramp.x, in.ramp.y, clamp(x / max(in.dims.x, 1e-3), 0.0, 1.0)) - 1.0;
 }
 
 @fragment
@@ -234,7 +245,7 @@ fn seg_fs(in: SegOut) -> @location(0) vec4f {
         let q = clamp(1.0 - abs(in.local.y) / max(in.dims.y, 1.0), 0.0, 1.0);
         let len = max(in.dims.x, 1e-3);
         let along = clamp(min(in.local.x + len * 0.5, len * 1.5 - in.local.x) / len, 0.0, 1.0);
-        return vec4f(in.color.rgb * q * q * along, 0.0);
+        return vec4f(in.color.rgb * q * q * along * ramp(in, in.local.x), 0.0);
     }
     // Dots and glows are measured from the centre, so they come out round.
     if in.dims.z > 0.5 {
@@ -250,5 +261,5 @@ fn seg_fs(in: SegOut) -> @location(0) vec4f {
     }
     let across = stroke(abs(in.local.y), in.dims.y);
     let along = clamp(min(in.local.x, in.dims.x - in.local.x) + 0.5, 0.0, 1.0);
-    return vec4f(in.color.rgb * across * along, 0.0);
+    return vec4f(in.color.rgb * across * along * ramp(in, in.local.x), 0.0);
 }

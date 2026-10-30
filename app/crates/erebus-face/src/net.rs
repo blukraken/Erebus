@@ -40,11 +40,11 @@ const WORKER_EMERGE: f32 = 4.0;
 const WORKER_DISSOLVE: f32 = 3.0;
 /// A pulse runs a session braid, globe to core, in this long, and a worker braid, worker to
 /// parent, in this long, seconds.
-const PULSE_SECS: f32 = 2.2;
-const WORKER_PULSE_SECS: f32 = 1.4;
+const PULSE_SECS: f32 = 4.0;
+const WORKER_PULSE_SECS: f32 = 2.6;
 /// Pulses on one braid launch at least this far apart, seconds, so events from one instant
 /// run one behind another in feed order.
-const PULSE_GAP: f32 = 0.35;
+const PULSE_GAP: f32 = 0.8;
 /// Pulses travelling on one braid at once, and waiting behind them.
 const PULSE_LIVE: usize = 6;
 const PULSE_QUEUE: usize = 24;
@@ -204,7 +204,9 @@ impl Pulses {
                 let rise = (t / 0.3).clamp(0.0, 1.0);
                 let fall = ((secs - t) / 0.25).clamp(0.0, 1.0);
                 let light = rise * rise * (3.0 - 2.0 * rise) * fall * fall * (3.0 - 2.0 * fall);
-                Lit { head: 1.0 - e_in_out(k), light, col, whole: reduced }
+                // Leaves already moving and eases into the far end. A slow start creeps
+                // under a pixel a frame and reads as stepping.
+                Lit { head: (1.0 - k) * (1.0 - k), light, col, whole: reduced }
             })
             .collect()
     }
@@ -369,8 +371,10 @@ struct Globe {
     /// A Codex session, drawn as a frost wireframe; a headless one is its hollow shell.
     codex: bool,
     headless: bool,
-    /// Seconds since it appeared, for the Codex globe's stepped turn.
+    /// Seconds on its own clock, for the Codex globe's stepped turn, and the Claude globe's
+    /// turn in radians. Both slow as the braid does while it waits.
     age: f32,
+    spin: f32,
     /// Ended while held near: it dissolves where it is, its braid unravelling with it.
     ended_near: bool,
     pulses: Pulses,
@@ -615,6 +619,7 @@ impl Net {
                         codex: s.harness == "codex",
                         headless: s.headless,
                         age: 0.0,
+                        spin: 0.0,
                         ended_near: false,
                         pulses: Pulses::default(),
                         tasks: Vec::new(),
@@ -845,12 +850,14 @@ impl Net {
             if !reduced {
                 // A held session braid stops still; a worker's ask only slows its parent's.
                 let held = g.hold * if g.asker.is_none() { 1.0 } else { 0.4 };
-                g.twist += dt * TWIST_PACE * (1.0 - (1.0 - WAIT_TWIST) * g.wait) * (1.0 - held);
+                let slow = 1.0 - (1.0 - WAIT_TWIST) * g.wait;
+                g.twist += dt * TWIST_PACE * slow * (1.0 - held);
                 for w in &mut g.workers {
                     let held = if g.asker.as_deref() == Some(&w.id) { g.hold } else { 0.0 };
                     w.twist += dt * TWIST_PACE * (1.0 - held);
                 }
-                g.age += dt;
+                g.age += dt * slow;
+                g.spin = (g.spin + dt * 0.4 * slow) % (TAU * 10.0);
             }
             let target = if g.pending.is_some() { 1.0 } else { 0.0 };
             let step = dt / quick(HOLD_SECS);
@@ -1138,6 +1145,8 @@ pub struct Frame {
     pub labels: Vec<Label>,
     /// The approval card, drawn through the panel host while it shows.
     pub card: Option<crate::panel::Frame>,
+    /// Segments cut by the buffer's cap this frame.
+    pub dropped: usize,
 }
 
 /// One globe's drawn place and size in pixels.
@@ -1210,20 +1219,26 @@ impl Net {
             let a = p.a * g.form.clamp(0.0, 1.0).sqrt();
             if g.codex {
                 let leaving = g.phase == Phase::Dissolving;
-                let ball = codex::Ball { c: p.c, r: p.r, alpha: p.a, secs: g.age, phase: phase(g.seed), headless: g.headless, form: g.form, leaving, u, reduced };
+                let ball = codex::Ball { c: p.c, r: p.r, alpha: p.a, secs: g.age, phase: phase(g.seed), headless: g.headless, form: g.form, leaving, u, reduced, grey: WAIT_GREY * g.wait };
                 codex::ball(&mut segs, &ball);
-            } else {
-                let [er, eg, eb] = theme::EMBER.srgb_f32();
+            }
+            // A waiting session's globe greys and calms with its braid.
+            let dull = WAIT_GREY * g.wait;
+            let ember = grey(theme::EMBER, dull);
+            if !g.codex {
+                let [er, eg, eb] = ember.srgb_f32();
+                let jitter = if g.busy { 0.16 - 0.1 * g.wait } else { 0.06 };
                 globes.push(GlobeInst {
-                    pos: [p.c[0], p.c[1], p.r, self.rot + phase(g.seed) * 0.37],
+                    pos: [p.c[0], p.c[1], p.r, g.spin + phase(g.seed) * 0.37],
                     color: [er, eg, eb, p.a],
-                    form: [0.0, g.form.clamp(0.0, 1.0), if g.busy { 0.16 } else { 0.06 }, (g.seed % 997) as f32],
+                    form: [0.0, g.form.clamp(0.0, 1.0), jitter, (g.seed % 997) as f32],
+                    look: [dull, 0.0, 0.0, 0.0],
                 });
             }
             if a > 0.01 && !g.codex {
-                segs.push(vitals::glow(p.c[0], p.c[1], 7.2 * p.r, theme::EMBER, 0.5 * a));
-                segs.push(vitals::glow(p.c[0], p.c[1], 1.2 * p.r, theme::HOT, 0.55 * a));
-                ticks(&mut segs, p.c, p.r + 5.0 * sc * g.scale, 72, 1.8 * sc * g.scale, 6, theme::EMBER, 0.32 * a, lws);
+                segs.push(vitals::glow(p.c[0], p.c[1], 7.2 * p.r, ember, 0.5 * a));
+                segs.push(vitals::glow(p.c[0], p.c[1], 1.2 * p.r, grey(theme::HOT, dull), 0.55 * a));
+                ticks(&mut segs, p.c, p.r + 5.0 * sc * g.scale, 72, 1.8 * sc * g.scale, 6, ember, 0.32 * a, lws);
             }
             if let Some(t) = g.ping {
                 ring(&mut segs, p.c, p.r + 12.0 * sc, theme::BONE, 0.9 * ping_light(t, reduced), 1.6 * lws);
@@ -1284,6 +1299,7 @@ impl Net {
                     pos: [wp.c[0], wp.c[1], wp.r, self.rot * 1.3 + phase(g.seed + i as u32)],
                     color: [br, bg, bb, wp.a],
                     form: [1.0, w.form, 0.0, ((g.seed + 31 * i as u32) % 997) as f32],
+                    look: [0.0; 4],
                 });
                 if wa > 0.01 {
                     // The worker braid trails out of the parent's nucleus behind the worker and
@@ -1310,6 +1326,7 @@ impl Net {
             }
         }
         globes.truncate(crate::globes::MAX_GLOBES);
+        let dropped = segs.len().saturating_sub(vitals::PANEL_SEGS);
         segs.truncate(vitals::PANEL_SEGS);
         let mut h = std::hash::DefaultHasher::new();
         for s in &segs {
@@ -1339,7 +1356,7 @@ impl Net {
             };
             Some(approval::frame(&view))
         });
-        Some(Frame { globes, segs, key: std::hash::Hasher::finish(&h), labels, card })
+        Some(Frame { globes, segs, key: std::hash::Hasher::finish(&h), labels, card, dropped })
     }
 }
 
@@ -1523,7 +1540,7 @@ fn hold_marks(out: &mut Vec<Seg>, gap: [f32; 2], edges: [[f32; 2]; 2], c: [f32; 
 }
 
 /// `c` with share `k` of its colour drained toward a grey of the same luma.
-fn grey(c: Rgb, k: f32) -> Rgb {
+pub(crate) fn grey(c: Rgb, k: f32) -> Rgb {
     let y = 0.299 * f32::from(c.0) + 0.587 * f32::from(c.1) + 0.114 * f32::from(c.2);
     let ch = |x: u8| (f32::from(x) + (y - f32::from(x)) * k.clamp(0.0, 1.0)).round() as u8;
     Rgb(ch(c.0), ch(c.1), ch(c.2))
@@ -1608,23 +1625,31 @@ fn braid(out: &mut Vec<Seg>, a0: [f32; 2], a1: [f32; 2], bow: f32, reach: f32, f
             out.push(vitals::seg(p0, p1, b.col, a * (0.5 + 0.5 * depth), w));
             for l in lit {
                 // Lit behind the head (toward `a1`, where it came from), brightest at the head.
-                let behind = (gl[i] + gl[i + 1]) * 0.5 - l.head * total;
-                let f = if l.whole {
-                    1.0
-                } else if behind >= 0.0 {
-                    (1.0 - behind / tail).max(0.0).powf(1.5)
-                } else {
-                    (1.0 + behind / (8.0 * sc)).max(0.0)
+                // Worked out at both ends and blended along the segment, so the light slides
+                // smoothly instead of stepping a segment at a time.
+                let lit_at = |at: f32| {
+                    let behind = at - l.head * total;
+                    if l.whole {
+                        1.0
+                    } else if behind >= 0.0 {
+                        (1.0 - behind / tail).max(0.0).powf(1.5)
+                    } else {
+                        (1.0 + behind / (8.0 * sc)).max(0.0)
+                    }
                 };
-                if f > 0.0 {
+                let (f0, f1) = (lit_at(gl[i]), lit_at(gl[i + 1]));
+                if f0 > 0.0 || f1 > 0.0 {
                     // The lit thread, and a soft halo hugging the same fibre.
-                    let a = l.light * f * (0.6 + 0.4 * depth);
-                    out.push(vitals::soft(p0, p1, l.col, 0.45 * a, 7.0 * sc));
-                    out.push(vitals::seg(p0, p1, l.col, a, w * 2.6));
+                    let a = l.light * (0.6 + 0.4 * depth);
+                    out.push(vitals::ramp(vitals::soft(p0, p1, l.col, 0.45 * a, 7.0 * sc), f0, f1));
+                    out.push(vitals::ramp(vitals::seg(p0, p1, l.col, a, w * 2.6), f0, f1));
                 }
                 if !l.whole && gl[i] <= l.head * total && l.head * total < gl[i + 1] {
-                    out.push(vitals::glow(p0[0], p0[1], 16.0 * sc, l.col, 0.75 * l.light));
-                    out.push(vitals::bead(p0[0], p0[1], 3.6 * lws, theme::HOT, 0.9 * l.light));
+                    // The head glides along the segment rather than hopping joint to joint.
+                    let t = (l.head * total - gl[i]) / (gl[i + 1] - gl[i]).max(1e-4);
+                    let h = [p0[0] + (p1[0] - p0[0]) * t, p0[1] + (p1[1] - p0[1]) * t];
+                    out.push(vitals::glow(h[0], h[1], 16.0 * sc, l.col, 0.75 * l.light));
+                    out.push(vitals::bead(h[0], h[1], 3.6 * lws, theme::HOT, 0.9 * l.light));
                 }
             }
         }
@@ -1916,6 +1941,27 @@ mod tests {
     }
 
     #[test]
+    fn a_waiting_globe_turns_slowly_and_greys_with_its_braid() {
+        let mut now = T0;
+        let mut n = net();
+        let mut w = info("w", false, 0);
+        w.status = SessionStatus::Waiting;
+        n.ingest_sessions(&[info("b", true, 0), w], now);
+        run(&mut n, GROW + HAUL_MAX + 1.0, &mut now);
+        let spins = |n: &Net| (get(n, "b").unwrap().spin, get(n, "w").unwrap().spin);
+        let (b0, w0) = spins(&n);
+        run(&mut n, 1.0, &mut now);
+        let (b1, w1) = spins(&n);
+        assert!(((w1 - w0) / (b1 - b0) - WAIT_TWIST).abs() < 0.01, "the waiting globe turns at the braid's pace");
+        let f = n.frame(&area(), false).unwrap();
+        let looks: Vec<f32> = f.globes.iter().map(|g| g.look[0]).collect();
+        assert!(looks.contains(&0.0) && looks.contains(&WAIT_GREY), "{looks:?}");
+        let grey = f.globes.iter().find(|g| g.look[0] > 0.0).unwrap();
+        let ember = theme::EMBER.srgb_f32();
+        assert!(grey.color[0] < ember[0] && grey.color[2] > ember[2], "the tint greys too");
+    }
+
+    #[test]
     fn a_codex_session_is_a_frost_wireframe_and_headless_is_smaller() {
         let now = T0;
         let mut n = net();
@@ -2114,11 +2160,16 @@ mod tests {
         // Every ember segment of the plain braid is still there, untouched: the pulse only adds.
         let ember = |v: &Vec<Seg>| v.iter().filter(|s| (s.color[1] / s.color[3].max(1e-6) - theme::EMBER.srgb_f32()[1]).abs() < 0.01).count();
         assert_eq!(ember(&plain), ember(&pulsed));
-        // Lit only near the head and behind it, toward the globe end.
+        // Lit only near the head and behind it, toward the globe end. A segment that straddles
+        // the leading edge counts, since its ramp fades it out ahead of the head.
         for s in red.iter().filter(|s| s.width[1] == 0.0) {
             let x = (s.ab[0] + s.ab[2]) / 2.0;
-            assert!(x > 400.0 - 20.0 && x < 400.0 + PULSE_TAIL * 2.0 + 20.0, "lit away from the head at {x}");
+            assert!(x > 400.0 - 30.0 && x < 400.0 + PULSE_TAIL * 2.0 + 20.0, "lit away from the head at {x}");
         }
+        // Lit segments blend their light from end to end rather than holding one level.
+        let strokes = red.iter().filter(|s| s.width[1] == 0.0 || s.width[1] == 3.0);
+        assert!(strokes.clone().all(|s| s.width[2] >= 1.0 && s.width[3] >= 1.0), "every lit stroke carries a ramp");
+        assert!(red.iter().any(|s| (s.width[2] - s.width[3]).abs() > 0.05), "the light varies along a segment");
         // Each lit segment lies on a fibre: wider than any strand's offset at that point.
         let strand_reach = 9.0 * 2.0;
         assert!(red.iter().filter(|s| s.width[1] == 0.0).any(|s| s.ab[1].abs() > strand_reach), "pulses ride the outer fibres");

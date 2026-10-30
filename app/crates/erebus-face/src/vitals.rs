@@ -258,6 +258,13 @@ pub fn seg(a: [f32; 2], b: [f32; 2], c: Rgb, alpha: f32, width: f32) -> Seg {
     Seg { ab: [a[0], a[1], b[0], b[1]], color: [r * alpha, g * alpha, bl * alpha, alpha], width: [width, 0.0, 0.0, 0.0] }
 }
 
+/// The stroke's brightness runs from `a` at its start to `b` at its end.
+pub fn ramp(mut s: Seg, a: f32, b: f32) -> Seg {
+    s.width[2] = 1.0 + a;
+    s.width[3] = 1.0 + b;
+    s
+}
+
 /// A round, anti-aliased dot of diameter `size`.
 pub fn bead(x: f32, y: f32, size: f32, c: Rgb, alpha: f32) -> Seg {
     let mut s = seg([x, y], [x, y], c, alpha, size);

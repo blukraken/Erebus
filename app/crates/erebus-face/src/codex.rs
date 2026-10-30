@@ -107,6 +107,8 @@ pub struct Ball {
     /// Pixels per prototype `U`.
     pub u: f32,
     pub reduced: bool,
+    /// 0..1: how far its colours are greyed, as a waiting session's are.
+    pub grey: f32,
 }
 
 /// A stable 0..1 value for element `k` of a mesh, so the same edge always assembles at the
@@ -136,9 +138,10 @@ pub fn ball(out: &mut Vec<Seg>, b: &Ball) {
     let (spin, flash) = if b.reduced { (0.0, 0.0) } else { turn(b.secs) };
     let rot = b.phase + spin;
     let [x, y] = b.c;
+    let (frost, ice) = (crate::net::grey(theme::FROST, b.grey), crate::net::grey(theme::ICE, b.grey));
     // Leaving, everything drifts outward as it breaks up.
     let drift = if b.leaving { 1.0 + 0.6 * (1.0 - f) } else { 1.0 };
-    out.push(vitals::glow(x, y, b.r * 3.2 * 2.0, theme::FROST, 0.34 * a * smooth(f / 0.6)));
+    out.push(vitals::glow(x, y, b.r * 3.2 * 2.0, frost, 0.34 * a * smooth(f / 0.6)));
     // `start..start + span` of `form` is when this mesh assembles.
     let wire = |out: &mut Vec<Seg>, m: &Mesh, rr: f32, ro: f32, tilt: f32, am: f32, lwm: f32, start: f32, span: f32| {
         let (sr, cr) = ro.sin_cos();
@@ -162,13 +165,13 @@ pub fn ball(out: &mut Vec<Seg>, b: &Ball) {
             let lerp = |t: f32| [p0[0] + (p1[0] - p0[0]) * t, p0[1] + (p1[1] - p0[1]) * t];
             let dd = (pts[*i][2] + pts[*j][2] + 2.0) / 4.0;
             let al = (0.12 + 0.62 * dd + 0.25 * flash * dd) * am * a;
-            out.push(vitals::seg(lerp(s0), lerp(s1), theme::FROST, al, lwm * lws));
+            out.push(vitals::seg(lerp(s0), lerp(s1), frost, al, lwm * lws));
             if b.leaving && q < 1.0 {
                 // The broken edge's dust, flung outward from the middle.
                 let m = lerp(0.5);
                 let (dx, dy) = (m[0] - x, m[1] - y);
                 let push = 1.0 + 0.5 * (1.0 - q);
-                out.push(vitals::bead(x + dx * push, y + dy * push, 1.2 * ds, theme::FROST, 0.6 * (1.0 - q) * f * am * a));
+                out.push(vitals::bead(x + dx * push, y + dy * push, 1.2 * ds, frost, 0.6 * (1.0 - q) * f * am * a));
             }
         }
         for (k, p) in pts.iter().enumerate() {
@@ -177,7 +180,7 @@ pub fn ball(out: &mut Vec<Seg>, b: &Ball) {
                 continue;
             }
             let dd = (p[2] + 1.0) / 2.0;
-            let col = if dd > 0.55 { theme::ICE } else { theme::FROST };
+            let col = if dd > 0.55 { ice } else { frost };
             // A spark: larger and brighter as it lands, settling to its resting size.
             let spark = if b.leaving { 1.0 } else { 1.0 + 1.5 * (1.0 - v) };
             out.push(vitals::bead(p[0], p[1], (0.9 + 1.5 * dd) * ds * spark, col, (0.25 + 0.7 * dd) * am * a * v.max(0.0)));
@@ -190,7 +193,7 @@ pub fn ball(out: &mut Vec<Seg>, b: &Ball) {
         wire(out, ico1(), b.r * 0.42, -rot * 1.5 + 0.4, 0.5, 0.9, 1.1, 0.45, 0.45);
         let core = smooth((f - 0.8) / 0.2);
         if core > 0.0 {
-            out.push(vitals::glow(x, y, b.r * 0.34 * 2.0, theme::ICE, (0.55 + 0.3 * flash) * a * core));
+            out.push(vitals::glow(x, y, b.r * 0.34 * 2.0, ice, (0.55 + 0.3 * flash) * a * core));
         }
     }
     // Double ticks: a hexagonal rhythm against Claude's 72 fine ticks. They draw in round
@@ -205,7 +208,7 @@ pub fn ball(out: &mut Vec<Seg>, b: &Ball) {
             let t = i as f32 / n as f32 * TAU + o - PI / 2.0;
             let (s, c) = t.sin_cos();
             let (r0, r1) = ((b.r + 5.0 * sc) * drift, (b.r + 10.0 * sc) * drift);
-            out.push(vitals::seg([x + c * r0, y + s * r0], [x + c * r1, y + s * r1], theme::FROST, 0.5 * a * k, 1.2 * lws));
+            out.push(vitals::seg([x + c * r0, y + s * r0], [x + c * r1, y + s * r1], frost, 0.5 * a * k, 1.2 * lws));
         }
     }
 }
@@ -215,7 +218,7 @@ mod tests {
     use super::*;
 
     fn ball_at(headless: bool) -> Ball {
-        Ball { c: [500.0, 300.0], r: 60.0, alpha: 1.0, secs: 0.3, phase: 0.0, headless, form: 1.0, leaving: false, u: 1.0, reduced: false }
+        Ball { c: [500.0, 300.0], r: 60.0, alpha: 1.0, secs: 0.3, phase: 0.0, headless, form: 1.0, leaving: false, u: 1.0, reduced: false, grey: 0.0 }
     }
 
     #[test]

@@ -16,6 +16,7 @@ struct Globe {
     pos: vec4f,     // centre x, y, radius, rotation
     color: vec4f,   // tint, opacity
     form: vec4f,    // kind, form, core jitter, seed
+    look: vec4f,    // grey, unused
 };
 
 @group(0) @binding(0) var<uniform> fr: Frame;
@@ -159,6 +160,9 @@ fn globe_vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) ->
         off = mix(dust, off, smoothstep(0.0, 1.0, fp));
         a *= 1.0 - (1.0 - fp) * (1.0 - fp);
     }
+
+    // A waiting session greys every dot, its hot core included.
+    rgb = mix(rgb, vec3f(dot(rgb, vec3f(0.299, 0.587, 0.114))), gl.look.x);
 
     a *= gl.color.a;
     if a <= 0.002 {
