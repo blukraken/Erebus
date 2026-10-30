@@ -392,6 +392,9 @@ struct Thread {
     who: String,
     tail: Tail,
     turn_open: bool,
+    /// A sub-agent whose turn has ended. Codex keeps a sub-agent's writer open for the whole
+    /// session, so its lock stays held after it finishes; it shows again if handed a new turn.
+    done: bool,
     asks: HashSet<String>,
 }
 
@@ -418,9 +421,13 @@ impl Thread {
 
     fn apply(&mut self, fact: Fact, ms: u64, mode: Mode, out: &mut Out) {
         match fact {
-            Fact::TurnStarted => self.turn_open = true,
+            Fact::TurnStarted => {
+                self.turn_open = true;
+                self.done = false;
+            }
             Fact::TurnEnded(interrupted) => {
                 self.turn_open = false;
+                self.done = true;
                 self.asks.clear();
                 if interrupted {
                     self.emit(out, mode, ms, FeedKind::Error, "interrupted");
@@ -430,6 +437,7 @@ impl Thread {
             }
             Fact::Item(line) => {
                 self.turn_open = true;
+                self.done = false;
                 if let Some((kind, what)) = line {
                     self.emit(out, mode, ms, kind, &what);
                 }
@@ -572,6 +580,7 @@ impl Service {
                     meta,
                     tail,
                     turn_open: false,
+                    done: false,
                     asks: HashSet::new(),
                 };
                 let kind = t.meta.role.clone().or_else(|| t.meta.nickname.clone()).unwrap_or_else(|| "agent".into());
@@ -591,6 +600,7 @@ impl Service {
                     meta,
                     tail,
                     turn_open: false,
+                    done: false,
                     asks: HashSet::new(),
                 };
                 t.emit(out, mode, t.meta.started_ms.max(1), FeedKind::Session, "started");
@@ -607,7 +617,7 @@ impl Service {
             .iter()
             .filter(|t| !t.sub())
             .map(|t| {
-                let mut subs: Vec<&Thread> = self.threads.iter().filter(|s| s.sub() && s.session == t.id).collect();
+                let mut subs: Vec<&Thread> = self.threads.iter().filter(|s| s.sub() && !s.done && s.session == t.id).collect();
                 subs.sort_by_key(|s| s.n);
                 let busy = t.turn_open || subs.iter().any(|s| s.turn_open);
                 let status = if !t.asks.is_empty() {
@@ -825,6 +835,30 @@ mod tests {
         t.release(ROOT);
         assert!(!held(&t.lock_path(ROOT)));
         assert!(!held(&t.root.join("missing.lock")));
+    }
+
+    #[test]
+    fn a_finished_sub_agent_leaves_while_its_lock_is_held() {
+        let mut t = Tree::new("subdone");
+        t.thread(ROOT, &[meta(ROOT, r"F:\Projects\Work", "codex-tui", "user", None), event("task_started", "")]);
+        t.thread(SUB, &[meta(SUB, r"F:\Projects\Work", "codex-tui", "subagent", Some(ROOT)), event("task_started", "")]);
+        let mut svc = t.service(Labels::default());
+        let (s, _) = svc.pass(1_793_300_000_000);
+        assert_eq!(s.unwrap()[0].workers.len(), 1);
+
+        t.append(SUB, &[event("task_complete", "")]);
+        t.append(ROOT, &[event("task_complete", "")]);
+        let (s, _) = svc.pass(1_793_300_002_000);
+        let root = &s.unwrap()[0];
+        assert!(root.workers.is_empty(), "the lock is still held, but the worker is done");
+        assert_eq!(root.status, SessionStatus::Idle);
+
+        t.append(SUB, &[event("task_started", "")]);
+        let (s, _) = svc.pass(1_793_300_004_000);
+        let root = &s.unwrap()[0];
+        assert_eq!(root.workers.len(), 1, "a new turn brings it back");
+        assert_eq!(root.workers[0].label, "w1");
+        assert_eq!(root.status, SessionStatus::Busy);
     }
 
     #[test]
